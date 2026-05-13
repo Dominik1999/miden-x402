@@ -1,0 +1,38 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/miden-x402-types",
+    "crates/miden-x402-facilitator",
+]
+
+[workspace.package]
+edition       = "2024"
+rust-version  = "1.85"
+license       = "Apache-2.0"
+repository    = "https://github.com/ermvrs/miden-x402"
+
+[workspace.dependencies]
+# Shared primitives
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+thiserror   = "2"
+base64      = "0.22"
+async-trait = "0.1"
+
+# x402 protocol
+x402-types  = "1.4"
+
+# Miden
+miden-client    = { version = "0.14", features = ["tonic"] }
+miden-standards = "0.14"
+
+# HTTP / runtime / observability
+axum               = "0.8"
+tokio              = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync"] }
+tower              = "0.5"
+tower-http         = { version = "0.6", features = ["trace", "cors"] }
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Internal
+miden-x402-types = { version = "0.1", path = "crates/miden-x402-types" }
