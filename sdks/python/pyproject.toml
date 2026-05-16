@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "miden-x402"
+version = "0.1.0"
+description = "Merchant SDK for x402 v2 on Miden (FastAPI + Flask)."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+authors = [{ name = "ermvrs" }]
+dependencies = [
+  "pydantic>=2.6",
+  "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+fastapi = ["fastapi>=0.110", "uvicorn>=0.30"]
+flask = ["flask>=3.0"]
+dev = [
+  "pytest>=8.0",
+  "pytest-asyncio>=0.23",
+  "mypy>=1.10",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/miden_x402"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

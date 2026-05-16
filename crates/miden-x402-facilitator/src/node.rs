@@ -192,8 +192,9 @@ impl MidenNode for GrpcMidenNode {
 }
 
 fn account_id_to_hex(id: &AccountId) -> Result<AccountIdHex, NodeError> {
-    let formatted = format!("0x{}", id.to_hex());
-    formatted
+    // `AccountId::to_hex()` already returns the canonical `0x`-prefixed form;
+    // do not double-prefix.
+    id.to_hex()
         .parse()
         .map_err(|e: miden_x402_types::IdError| NodeError::InvalidIdentifier(e.to_string()))
 }

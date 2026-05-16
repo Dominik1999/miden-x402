@@ -1,0 +1,13 @@
+{
+  "name": "miden-x402-node-sdk",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Reference Node.js SDK for x402 v2 on Miden (merchant middleware + agent client).",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "build": "pnpm -r --filter './packages/*' build",
+    "typecheck": "pnpm -r --filter './packages/*' typecheck"
+  },
+  "packageManager": "pnpm@10.11.1"
+}

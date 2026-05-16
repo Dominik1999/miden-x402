@@ -324,8 +324,10 @@ is `400` for client-side failures and `500` for unexpected node failures.
 | Wire types (`miden-x402-types`) | M1 — shipped |
 | Facilitator (`miden-x402-facilitator`) | M2 — shipped |
 | Header contract (this document + helpers) | M3 — shipped |
-| Node SDK (merchant + agent) | M4 — pending |
-| Python SDK (merchant) | M5 — pending |
+| Live testnet smoke binary (`miden-x402-smoke-testnet`) | M4a — shipped |
+| Node SDK (merchant + agent) | M4b — shipped |
+| Python SDK (merchant) | M5 — shipped |
+| Quickstart README + scheme + deploy docs | M6 — shipped |
 | Private notes (`noteType: "private"`) | Phase 2 |
 
 [`ErrorReason`]: https://docs.rs/x402-types/latest/x402_types/proto/enum.ErrorReason.html
