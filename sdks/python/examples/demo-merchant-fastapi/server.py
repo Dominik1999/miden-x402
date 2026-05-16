@@ -16,7 +16,7 @@ import sys
 from fastapi import Depends, FastAPI
 
 from miden_x402 import PaywallConfig, PriceTag
-from miden_x402.fastapi import paywall
+from miden_x402.fastapi import install_paywall_exception_handler, paywall
 
 
 def _required(key: str) -> str:
@@ -42,6 +42,7 @@ price = PriceTag(
 config = PaywallConfig(facilitator_url=FACILITATOR_URL)
 
 app = FastAPI()
+install_paywall_exception_handler(app)
 
 
 @app.get(

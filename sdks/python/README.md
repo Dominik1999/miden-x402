@@ -17,9 +17,10 @@ pip install -e '.[fastapi,flask]'
 ```python
 from fastapi import FastAPI
 from miden_x402 import PaywallConfig, PriceTag
-from miden_x402.fastapi import paywall
+from miden_x402.fastapi import install_paywall_exception_handler, paywall
 
 app = FastAPI()
+install_paywall_exception_handler(app)  # required so 402 bodies aren't wrapped in `detail`
 
 price = PriceTag(
     amount="1000",

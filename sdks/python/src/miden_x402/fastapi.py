@@ -24,7 +24,8 @@ from __future__ import annotations
 from typing import Callable
 
 try:
-    from fastapi import HTTPException, Request, Response
+    from fastapi import FastAPI, Request, Response
+    from fastapi.responses import JSONResponse
 except ImportError as e:  # pragma: no cover
     raise ImportError(
         "FastAPI is not installed. `pip install miden-x402[fastapi]`."
@@ -44,7 +45,40 @@ from .headers import (
     encode_payment_required_header,
     encode_payment_response_header,
 )
-from .types import ResourceInfo
+from .types import MidenPaymentRequired, ResourceInfo
+
+
+class PaywallRejected(Exception):
+    """Raised by the paywall dependency when a request must be answered
+    with a 402. Pair with :func:`install_paywall_exception_handler` so
+    FastAPI emits the canonical x402 PaymentRequired body (and not the
+    default ``{"detail": ...}`` wrapper).
+    """
+
+    def __init__(self, body: MidenPaymentRequired, header_value: str) -> None:
+        super().__init__("payment required")
+        self.body = body
+        self.header_value = header_value
+
+
+async def _paywall_exception_handler(
+    _request: Request, exc: PaywallRejected
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=402,
+        content=exc.body.model_dump(by_alias=True, exclude_none=True),
+        headers={PAYMENT_REQUIRED_HEADER: exc.header_value},
+    )
+
+
+def install_paywall_exception_handler(app: FastAPI) -> None:
+    """Register the exception handler that emits the canonical 402 body.
+
+    Call once at app setup. Without this, FastAPI's default handler would
+    wrap the body in ``{"detail": ...}`` which buyers shouldn't have to
+    parse around.
+    """
+    app.add_exception_handler(PaywallRejected, _paywall_exception_handler)
 
 
 def paywall(
@@ -54,7 +88,12 @@ def paywall(
     description: str | None = None,
     mime_type: str | None = None,
 ) -> Callable[[Request, Response], None]:
-    """Returns a FastAPI dependency that enforces the paywall."""
+    """Returns a FastAPI dependency that enforces the paywall.
+
+    The dependency raises :class:`PaywallRejected` on the 402 path; this
+    only renders correctly if the app has called
+    :func:`install_paywall_exception_handler`.
+    """
 
     def dependency(request: Request, response: Response) -> None:
         resource = ResourceInfo(
@@ -76,12 +115,7 @@ def paywall(
             return
         if isinstance(outcome, Reject):
             header_value = encode_payment_required_header(outcome.body)
-            body_dict = outcome.body.model_dump(by_alias=True, exclude_none=True)
-            raise HTTPException(
-                status_code=402,
-                detail=body_dict,
-                headers={PAYMENT_REQUIRED_HEADER: header_value},
-            )
+            raise PaywallRejected(outcome.body, header_value)
         raise RuntimeError(f"unreachable PaymentOutcome variant: {outcome!r}")
 
     return dependency
