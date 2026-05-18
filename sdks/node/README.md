@@ -20,9 +20,9 @@ crates in [`crates/`](../../crates/).
 
 | Demo | Path | What it does |
 |---|---|---|
-| `demo-merchant-express` | [`examples/demo-merchant-express`](./examples/demo-merchant-express) | Express server gating `GET /weather` behind 1000 atomic-unit USDC |
-| `demo-merchant-hono`    | [`examples/demo-merchant-hono`](./examples/demo-merchant-hono)    | Hono parity of the above |
-| `demo-agent`            | [`examples/demo-agent`](./examples/demo-agent)            | CLI that pays the demo merchant, mock-payer mode for wiring tests |
+| `demo-merchant-express` | [`examples/demo-merchant-express`](./examples/demo-merchant-express) | Express server with `GET /weather` (public note) and `GET /weather-private` (private note), both behind 1000 atomic-unit USDC |
+| `demo-merchant-hono`    | [`examples/demo-merchant-hono`](./examples/demo-merchant-hono)    | Hono parity of the above, same two routes |
+| `demo-agent`            | [`examples/demo-agent`](./examples/demo-agent)            | CLI that pays the demo merchant; supports both public and private notes, with a mock-payer mode for wiring tests |
 
 ## Quickstart
 
@@ -104,18 +104,98 @@ app.listen(3000);
 That's the merchant integration in seven lines. The Hono variant is the
 same shape — import from `@miden-x402/merchant/hono` instead.
 
+### Private notes (M7)
+
+Set `noteType: 'private'` on the `PriceTag` to opt into settled-at-commit
+private P2ID. Same trust model, same end-to-end latency; only the
+transaction-graph exposure on chain differs. The merchant code is
+unchanged — the facilitator and agent SDKs handle the off-chain
+`NoteFile` blob transport.
+
+```ts
+paywall({
+  facilitatorUrl: 'https://your-facilitator.example.com',
+  price: {
+    amount: '1000',
+    asset: '0x0a7d175ed63ec5200fb2ced86f6aa5',
+    payTo: '0x...',
+    tokenSymbol: 'USDC',
+    decimals: 6,
+    noteType: 'private',
+  },
+});
+```
+
+A live `/weather-private` route is wired in
+[`examples/demo-merchant-express`](./examples/demo-merchant-express) and
+[`examples/demo-merchant-hono`](./examples/demo-merchant-hono).
+
+### Guardian verify-before-prove (M8)
+
+Set `settlement: 'guardian-fast'` on the `PriceTag` to opt into the
+Guardian flow (sub-second perceived latency, Guardian trust model). The
+merchant SDK auto-calls the facilitator's `/guardian/challenge` endpoint
+on the first request and inlines the server-issued `serial_num` into the
+402 response; on the retry it forwards to `/guardian/settle`. Requires
+the facilitator to be started with `MIDEN_X402_GUARDIAN_ENABLED=true`.
+
+```ts
+paywall({
+  facilitatorUrl: 'https://guardian-facilitator.example.com',
+  price: {
+    amount: '1000',
+    asset: '0x0a7d175ed63ec5200fb2ced86f6aa5',
+    payTo: '0x...',
+    tokenSymbol: 'USDC',
+    decimals: 6,
+    noteType: 'private',
+    settlement: 'guardian-fast',
+  },
+});
+```
+
+For the agent side, the configured `Payer` must implement the optional
+`payP2IDUnproven` method. The bundled `createWasmSdkPayer` delegates to a
+`client.buildSignedUnprovenP2id` method on the underlying WASM SDK and
+throws a clear `WasmSdkPayerError` if the installed `@miden-sdk/miden-sdk`
+version does not yet expose it. See
+[`docs/protocol.md`](../../docs/protocol.md) §A.2.7 for the full wire
+contract.
+
 ## Implementing a custom `Payer`
 
 The agent does not depend on `@miden-sdk/miden-sdk` directly; it accepts
-any object implementing `Payer`:
+any object implementing `Payer`. For settled-at-commit payments
+(`'commit'` flow), implement `payP2ID`; for private notes also populate
+`noteBlob` in the returned receipt. For the Guardian flow, optionally
+implement `payP2IDUnproven`.
 
 ```ts
 import { withMidenX402, type Payer } from '@miden-x402/agent';
 
 const payer: Payer = {
-  async payP2ID({ payTo, asset, amount }) {
+  async payP2ID({ payTo, asset, amount, noteType }) {
     // your Miden client here
-    return { noteId, transactionId, sender, blockNum };
+    return {
+      noteId,
+      transactionId,
+      sender,
+      blockNum,
+      noteBlob, // required when noteType === 'private'
+    };
+  },
+
+  // Optional — only needed if you support the Guardian flow.
+  async payP2IDUnproven({ payTo, asset, amount, serialNum }) {
+    // build P2ID with the server-issued serialNum, sign without proving
+    return {
+      txInputs,         // base64(TransactionInputs)
+      signature,        // base64(Signature)
+      signedSummary,    // base64(TransactionSummary)
+      expectedNoteBlob, // base64(NoteFile::NoteDetails)
+      transactionId,
+      sender,
+    };
   },
 };
 

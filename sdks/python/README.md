@@ -63,6 +63,51 @@ def weather():
     return jsonify(temperature=21.5, city="Istanbul")
 ```
 
+### Private notes (M7)
+
+Set `note_type="private"` on the ``PriceTag`` to opt into settled-at-commit
+private P2ID. The merchant code is unchanged; the facilitator and Node
+agent handle the off-chain ``NoteFile`` blob transport transparently.
+
+```python
+price_private = PriceTag(
+    amount="1000",
+    asset="0x0a7d175ed63ec5200fb2ced86f6aa5",
+    pay_to="0x...your-merchant-account-id...",
+    token_symbol="USDC",
+    decimals=6,
+    note_type="private",
+)
+```
+
+A live `/weather-private` route is wired in
+[`examples/demo-merchant-fastapi`](./examples/demo-merchant-fastapi) and
+[`examples/demo-merchant-flask`](./examples/demo-merchant-flask).
+
+### Guardian verify-before-prove (M8)
+
+Set ``settlement="guardian-fast"`` to opt into the Guardian flow. The
+merchant SDK auto-calls the facilitator's ``/guardian/challenge`` endpoint
+on the first request and inlines the server-issued ``serial_num`` into the
+402 response; on the retry it forwards to ``/guardian/settle``. Requires
+the facilitator to be started with ``MIDEN_X402_GUARDIAN_ENABLED=true``.
+
+```python
+price_fast = PriceTag(
+    amount="1000",
+    asset="0x0a7d175ed63ec5200fb2ced86f6aa5",
+    pay_to="0x...",
+    token_symbol="USDC",
+    decimals=6,
+    note_type="private",
+    settlement="guardian-fast",
+)
+```
+
+See [`docs/protocol.md`](../../docs/protocol.md) §A.2.7 for the full
+wire contract and [`docs/deploy.md`](../../docs/deploy.md) for the
+Guardian environment variables on the facilitator side.
+
 ## Cross-language E2E
 
 Use the Node agent (from `sdks/node`) to drive a Python merchant:

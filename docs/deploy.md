@@ -32,12 +32,43 @@ All optional; defaults documented in
 | `MIDEN_X402_RPC_TIMEOUT_MS` | `10000` | Per-call gRPC timeout. |
 | `MIDEN_X402_ALLOWED_FAUCETS` | `0x0a7d175ed63ec5200fb2ced86f6aa5` | Comma-separated faucet account ids accepted as payment assets. Use `*` to allow any (dev only). |
 | `MIDEN_X402_FRESHNESS_BLOCKS` | `24` | Max blocks between note commit and chain tip before a note is rejected as expired. ~2 minutes at ~5s blocks. |
+| `MIDEN_X402_GUARDIAN_ENABLED` | `false` | Enable the Phase B `/guardian/*` endpoints. When `false` (default) they are absent from the router and the facilitator behaves byte-for-byte like Phase A. |
+| `MIDEN_X402_REMOTE_PROVER_URL` | _unset_ | gRPC URL of the Miden remote prover. Required when the Guardian is enabled; without it `/guardian/settle` returns `503 Service Unavailable`. |
+| `MIDEN_X402_GUARDIAN_CHALLENGE_TTL_SECS` | `120` | TTL applied to issued `serial_num` challenges. Should be ≥ the merchant's advertised `maxTimeoutSeconds`. |
+| `MIDEN_X402_GUARDIAN_RESERVATION_TTL_SECS` | `60` | TTL applied to reserved input nullifiers. Defensive — the verify/settle success and failure paths normally release reservations explicitly. |
 | `RUST_LOG` | `info` | Standard `tracing-subscriber` env filter. |
 
 The freshness window has a direct UX effect: too tight and slow buyers
 get their notes rejected; too loose and a stale signed payload could be
 replayed long after the merchant offered it. Start with the default and
 tune from production traces.
+
+## Enabling the Guardian (Phase B)
+
+The `/guardian/*` endpoints implement the verify-before-prove flow
+documented in [`ideas/GUARDIAN.md`](../ideas/GUARDIAN.md) and
+[`docs/protocol.md`](./protocol.md) §A.2.7 + §B.2.7. They are
+**disabled by default**. To turn them on:
+
+```bash
+MIDEN_X402_GUARDIAN_ENABLED=true \
+MIDEN_X402_REMOTE_PROVER_URL=https://prover.miden.host:50051 \
+./target/release/miden-x402-facilitator
+```
+
+When enabled:
+
+- `/supported` advertises `"miden-guardian-fast"` in `extensions`.
+- `POST /guardian/challenge` accepts merchant requests for a
+  server-generated `serial_num`.
+- `POST /guardian/verify` and `POST /guardian/settle` accept signed
+  unproven transactions; settle forwards to the remote prover and
+  submits the resulting `ProvenTransaction` to the configured Miden node.
+
+Guardian state (issued challenges + reserved nullifiers) is held in
+memory inside the process. A single Guardian deployment is one process
+— horizontal scaling requires either sticky routing or moving state to
+a shared store (not implemented in this iteration).
 
 ## Health probes
 
