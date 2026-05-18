@@ -99,9 +99,35 @@ pub enum NoteKind {
     /// Public P2ID — full note + assets stored by the network.
     Public,
     /// Private P2ID — only the commitment and nullifier appear on chain.
-    /// Phase 2 of this project; declared here so the wire format does not
-    /// have to change later.
     Private,
+}
+
+/// Settlement model the buyer expects: `Commit` (default) means
+/// settled-at-commit — the buyer proves + submits the create-note tx itself
+/// and the facilitator just verifies. `GuardianFast` means verify-before-prove
+/// — the buyer hands the facilitator a signed-but-unproven transaction; the
+/// facilitator verifies the Falcon signature offline, reserves the input
+/// nullifiers, replies OK, then proves + submits asynchronously via a remote
+/// prover. Trust model under `GuardianFast` is the same as Base's x402
+/// facilitator.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SettlementKind {
+    /// Settled-at-commit. The buyer proves + submits the create-note tx and
+    /// the facilitator is a read-only verifier of the on-chain state.
+    /// Default — matches the Phase A behaviour and is wire-compatible with
+    /// pre-Phase-B clients that don't send this field at all.
+    #[default]
+    Commit,
+    /// Verify-before-prove. The Guardian-facilitator verifies a signed
+    /// unproven transaction, reserves the input nullifiers in memory, and
+    /// proves + submits the tx asynchronously. Only meaningful with
+    /// `noteType: "private"`.
+    GuardianFast,
+}
+
+fn is_default_settlement(s: &SettlementKind) -> bool {
+    matches!(s, SettlementKind::Commit)
 }
 
 /// Contents of the `extra` field on a Miden `exact` [`PaymentRequirements`].
@@ -118,21 +144,71 @@ pub struct MidenExactExtra {
     pub decimals: u8,
     /// Whether payments use public or private P2ID notes.
     pub note_type: NoteKind,
+    /// Settlement model. Defaults to [`SettlementKind::Commit`] when absent
+    /// on the wire — preserves Phase A's wire format byte-for-byte.
+    #[serde(default, skip_serializing_if = "is_default_settlement")]
+    pub settlement: SettlementKind,
+    /// Guardian facilitator URL — only meaningful with
+    /// `settlement: "guardian-fast"`. Tells the agent which endpoint to POST
+    /// the signed unproven transaction to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guardian_url: Option<String>,
+    /// Server-generated `serial_num` (32-byte `Word`). Only meaningful with
+    /// `settlement: "guardian-fast"`. The buyer MUST use this exact serial
+    /// number when constructing the P2ID note so the Guardian knows the
+    /// future nullifier the moment it issues the 402. Reused as the
+    /// challenge id by the facilitator's `ChallengeStore`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial_num: Option<NoteIdHex>,
 }
 
 /// The scheme-specific payload that travels in `PAYMENT-SIGNATURE`.
 ///
-/// Tagged on `noteType`. The `Private` variant is declared so the wire format
-/// is stable across Phase 1 (MVP) and Phase 2; a Phase 1 facilitator rejects
-/// it with `ErrorReason::UnsupportedScheme`.
+/// Tagged on `noteType` with three variants:
+///
+/// - `"public"`: settled-at-commit, public P2ID note. Resolvable from the
+///   on-chain commitment alone.
+/// - `"private"`: settled-at-commit, private P2ID note. The body lives in the
+///   off-chain `noteBlob`; the facilitator binds it to chain by recomputing
+///   the commitment.
+/// - `"guardianFast"`: verify-before-prove, private P2ID note. Carries a
+///   signed-but-unproven `TransactionInputs` blob. The semantic note kind is
+///   still private; the discriminator difference indicates the settlement
+///   path (Guardian) the facilitator should route through. See
+///   [`SettlementKind::GuardianFast`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "noteType", rename_all = "lowercase")]
+#[serde(tag = "noteType", rename_all = "camelCase")]
 pub enum MidenExactPayload {
     /// Payment by a public P2ID note. The note + assets are stored by the
     /// Miden network and verifiable by id alone.
     Public(PublicP2idPayload),
-    /// Payment by a private P2ID note. Phase 2 only.
+    /// Payment by a private P2ID note, settled-at-commit.
     Private(PrivateP2idPayload),
+    /// Payment by a signed-but-unproven private P2ID transaction. The
+    /// Guardian-facilitator verifies the Falcon signature offline and
+    /// proves + submits asynchronously.
+    GuardianFast(GuardianFastPayload),
+}
+
+impl MidenExactPayload {
+    /// Semantic note kind backing each variant. Both `Private` and
+    /// `GuardianFast` are semantically private notes; only the settlement
+    /// flow differs. Used by the facilitator's agreement step to confirm
+    /// `extra.noteType` matches the payload variant.
+    pub fn semantic_note_type(&self) -> NoteKind {
+        match self {
+            MidenExactPayload::Public(_) => NoteKind::Public,
+            MidenExactPayload::Private(_) | MidenExactPayload::GuardianFast(_) => NoteKind::Private,
+        }
+    }
+
+    /// Settlement model implied by the variant.
+    pub fn implied_settlement(&self) -> SettlementKind {
+        match self {
+            MidenExactPayload::Public(_) | MidenExactPayload::Private(_) => SettlementKind::Commit,
+            MidenExactPayload::GuardianFast(_) => SettlementKind::GuardianFast,
+        }
+    }
 }
 
 /// Public-note payment payload: just enough metadata for the facilitator to
@@ -154,16 +230,97 @@ pub struct PublicP2idPayload {
     pub amount: String,
 }
 
-/// Private-note payment payload — Phase 2.
+/// Private-note payment payload.
 ///
 /// Carries the serialised Miden `NoteFile` so the facilitator can import the
-/// note, recompute the commitment, and verify against the node. The blob is
-/// base64-encoded for header safety. Not used by Phase 1.
+/// note, recompute the commitment, and bind it to the on-chain commitment
+/// fetched by `note_id`. The blob is base64-encoded for header safety. The
+/// remaining fields mirror [`PublicP2idPayload`] so the wire envelope is
+/// uniform across both note types and the facilitator can produce the same
+/// `SettleResponse::Success` shape for both.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PrivateP2idPayload {
     /// Base64-encoded serialised `miden_protocol::note::NoteFile`.
     pub note_blob: String,
+    /// Miden `TransactionId` of the note-creation transaction.
+    pub transaction_id: TransactionIdHex,
+    /// Account ID of the payer (the note's sender).
+    pub sender: AccountIdHex,
+    /// Block number in which the note's commitment was committed.
+    pub block_num: u32,
+    /// Faucet account ID of the fungible asset transferred.
+    pub asset: AccountIdHex,
+    /// Asset amount in atomic units, as a decimal string (x402 v2 convention).
+    pub amount: String,
+}
+
+/// Guardian-flow payment payload.
+///
+/// Carries the signed-but-unproven `TransactionInputs` (base64 of the
+/// canonical Miden serialisation), the `expected_note_blob` (so the
+/// facilitator can recompute the recipient/asset binding without re-executing
+/// the tx), and a copy of the server-issued `serial_num` (which the
+/// facilitator uses to look up the challenge in its in-memory store).
+///
+/// Unlike the `Commit` variants, `transaction_id` here is the *pre-prove* id
+/// derived deterministically from `TransactionInputs` — the post-prove
+/// `ProvenTransaction` id will be the one returned in `SettleResponse`.
+/// `block_num` is intentionally absent because the tx has not yet been
+/// included in a block at the time the payload is constructed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GuardianFastPayload {
+    /// Base64-encoded canonical `miden_protocol::transaction::TransactionInputs`.
+    /// The Guardian uses this for two things: reading the buyer's
+    /// `PartialAccount.storage()` to locate the on-chain
+    /// `PublicKeyCommitment`, and forwarding to `RemoteTransactionProver` at
+    /// settle-time.
+    pub tx_inputs: String,
+    /// Base64-encoded `miden_protocol::account::auth::Signature` carrying the
+    /// buyer's authorization over the tx summary. The Guardian re-injects
+    /// this into `tx_args.advice_inputs.map` at prove-and-submit time. Sent
+    /// as a separate field (rather than only via the advice map) because the
+    /// advice map stores the prepared stack-reversed form which cannot be
+    /// inverted back to the high-level [`Signature`] needed for offline
+    /// verification.
+    ///
+    /// [`Signature`]: https://docs.rs/miden-protocol/0.14/miden_protocol/account/auth/enum.Signature.html
+    pub signature: String,
+    /// Base64-encoded `miden_protocol::transaction::TransactionSummary` —
+    /// the exact value whose `.to_commitment()` digest the buyer signed.
+    /// The Guardian:
+    ///
+    /// 1. Verifies `signed_summary.input_notes.commitment() ==
+    ///    tx_inputs.input_notes().commitment()` to bind the signed summary
+    ///    to the executable tx.
+    /// 2. Verifies the recomputed output `NoteId` from `expected_note_blob`
+    ///    appears in `signed_summary.output_notes`, binding the summary to
+    ///    the buyer's claimed output P2ID note.
+    /// 3. Verifies `signature` against `signed_summary.to_commitment()`.
+    ///
+    /// Carried explicitly because the salt component of the summary is
+    /// generated inside the VM kernel during execution and is not
+    /// derivable from `TransactionInputs` alone.
+    pub signed_summary: String,
+    /// Base64-encoded `miden_protocol::note::NoteFile::NoteDetails` for the
+    /// expected output note. Used by the facilitator to recompute the
+    /// recipient/asset binding and bind it against the tx's
+    /// `output_notes_commitment` (which the signature already attests to).
+    pub expected_note_blob: String,
+    /// Echo of `requirements.extra.serialNum`. Must match the value the
+    /// Guardian generated at challenge-issue time, and must match the
+    /// `serial_num` baked into `expected_note_blob`.
+    pub serial_num: NoteIdHex,
+    /// Pre-prove `TransactionId` derived deterministically from
+    /// `TransactionInputs`.
+    pub transaction_id: TransactionIdHex,
+    /// Account ID of the payer (the note's sender).
+    pub sender: AccountIdHex,
+    /// Faucet account ID of the fungible asset transferred.
+    pub asset: AccountIdHex,
+    /// Asset amount in atomic units, as a decimal string.
+    pub amount: String,
 }
 
 #[cfg(test)]
@@ -226,14 +383,35 @@ mod tests {
         assert_eq!(json["amount"], "1000");
     }
 
+    fn sample_private_payload() -> PrivateP2idPayload {
+        PrivateP2idPayload {
+            note_blob: "Zm9v".to_owned(),
+            transaction_id: sample_word('b').parse().unwrap(),
+            sender: sample_account(),
+            block_num: 1_234_567,
+            asset: sample_account(),
+            amount: "1000".to_owned(),
+        }
+    }
+
     #[test]
     fn private_payload_serialises_with_tag() {
-        let payload = MidenExactPayload::Private(PrivateP2idPayload {
-            note_blob: "Zm9v".to_owned(),
-        });
+        let payload = MidenExactPayload::Private(sample_private_payload());
         let json = serde_json::to_value(&payload).unwrap();
         assert_eq!(json["noteType"], "private");
         assert_eq!(json["noteBlob"], "Zm9v");
+        assert!(json["transactionId"].is_string());
+        assert!(json["sender"].is_string());
+        assert!(json["blockNum"].is_u64());
+        assert_eq!(json["amount"], "1000");
+    }
+
+    #[test]
+    fn private_payload_round_trips() {
+        let original = MidenExactPayload::Private(sample_private_payload());
+        let json = serde_json::to_string(&original).unwrap();
+        let decoded: MidenExactPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, original);
     }
 
     #[test]
@@ -251,6 +429,85 @@ mod tests {
         assert!(res.is_err());
     }
 
+    fn sample_guardian_fast_payload() -> GuardianFastPayload {
+        GuardianFastPayload {
+            tx_inputs: "AAA=".to_owned(),
+            signature: "c2ln".to_owned(),
+            signed_summary: "c3VtbWFyeQ==".to_owned(),
+            expected_note_blob: "AAB=".to_owned(),
+            serial_num: sample_word('c').parse().unwrap(),
+            transaction_id: sample_word('b').parse().unwrap(),
+            sender: sample_account(),
+            asset: sample_account(),
+            amount: "1000".to_owned(),
+        }
+    }
+
+    #[test]
+    fn guardian_fast_payload_serialises_with_tag() {
+        let payload = MidenExactPayload::GuardianFast(sample_guardian_fast_payload());
+        let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(json["noteType"], "guardianFast");
+        assert_eq!(json["txInputs"], "AAA=");
+        assert_eq!(json["expectedNoteBlob"], "AAB=");
+        assert!(json["serialNum"].is_string());
+        assert!(json["transactionId"].is_string());
+        assert!(json["sender"].is_string());
+        assert_eq!(json["amount"], "1000");
+        assert!(json.get("blockNum").is_none(), "guardianFast payload omits blockNum");
+    }
+
+    #[test]
+    fn guardian_fast_payload_round_trips() {
+        let original = MidenExactPayload::GuardianFast(sample_guardian_fast_payload());
+        let json = serde_json::to_string(&original).unwrap();
+        let decoded: MidenExactPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn semantic_note_type_maps_correctly() {
+        assert_eq!(
+            MidenExactPayload::Public(sample_public_payload()).semantic_note_type(),
+            NoteKind::Public,
+        );
+        assert_eq!(
+            MidenExactPayload::Private(sample_private_payload()).semantic_note_type(),
+            NoteKind::Private,
+        );
+        // GuardianFast is semantically a private note — only the settlement
+        // path differs.
+        assert_eq!(
+            MidenExactPayload::GuardianFast(sample_guardian_fast_payload()).semantic_note_type(),
+            NoteKind::Private,
+        );
+    }
+
+    #[test]
+    fn implied_settlement_maps_correctly() {
+        assert_eq!(
+            MidenExactPayload::Public(sample_public_payload()).implied_settlement(),
+            SettlementKind::Commit,
+        );
+        assert_eq!(
+            MidenExactPayload::Private(sample_private_payload()).implied_settlement(),
+            SettlementKind::Commit,
+        );
+        assert_eq!(
+            MidenExactPayload::GuardianFast(sample_guardian_fast_payload()).implied_settlement(),
+            SettlementKind::GuardianFast,
+        );
+    }
+
+    #[test]
+    fn settlement_kind_serialises_as_kebab_case() {
+        assert_eq!(serde_json::to_string(&SettlementKind::Commit).unwrap(), "\"commit\"");
+        assert_eq!(
+            serde_json::to_string(&SettlementKind::GuardianFast).unwrap(),
+            "\"guardian-fast\"",
+        );
+    }
+
     #[test]
     fn extra_round_trips() {
         let extra = MidenExactExtra {
@@ -258,11 +515,55 @@ mod tests {
             token_symbol: "USDC".to_owned(),
             decimals: 6,
             note_type: NoteKind::Public,
+            settlement: SettlementKind::Commit,
+            guardian_url: None,
+            serial_num: None,
         };
         let json = serde_json::to_string(&extra).unwrap();
         let decoded: MidenExactExtra = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, extra);
         assert!(json.contains("\"assetTransferMethod\":\"miden-p2id\""));
         assert!(json.contains("\"noteType\":\"public\""));
+        // Default settlement is omitted on the wire to preserve Phase A
+        // byte-for-byte compatibility for any consumer that doesn't know
+        // about the field.
+        assert!(!json.contains("settlement"));
+        assert!(!json.contains("guardianUrl"));
+        assert!(!json.contains("serialNum"));
+    }
+
+    #[test]
+    fn extra_guardian_fast_round_trips_and_emits_fields() {
+        let extra = MidenExactExtra {
+            asset_transfer_method: AssetTransferMethodTag,
+            token_symbol: "USDC".to_owned(),
+            decimals: 6,
+            note_type: NoteKind::Private,
+            settlement: SettlementKind::GuardianFast,
+            guardian_url: Some("https://facilitator.miden.io".to_owned()),
+            serial_num: Some(sample_word('c').parse().unwrap()),
+        };
+        let json = serde_json::to_string(&extra).unwrap();
+        let decoded: MidenExactExtra = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, extra);
+        assert!(json.contains("\"settlement\":\"guardian-fast\""));
+        assert!(json.contains("\"guardianUrl\":\"https://facilitator.miden.io\""));
+        assert!(json.contains("\"serialNum\":"));
+    }
+
+    #[test]
+    fn extra_accepts_phase_a_wire_without_settlement_fields() {
+        // A Phase A consumer never sent settlement/guardianUrl/serialNum.
+        // Phase B types must accept that wire bit-perfect.
+        let json = r#"{
+            "assetTransferMethod": "miden-p2id",
+            "tokenSymbol": "USDC",
+            "decimals": 6,
+            "noteType": "public"
+        }"#;
+        let extra: MidenExactExtra = serde_json::from_str(json).unwrap();
+        assert_eq!(extra.settlement, SettlementKind::Commit);
+        assert!(extra.guardian_url.is_none());
+        assert!(extra.serial_num.is_none());
     }
 }

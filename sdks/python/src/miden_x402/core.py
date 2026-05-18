@@ -46,6 +46,11 @@ class PriceTag:
     network: str = MIDEN_TESTNET
     note_type: str = "public"
     max_timeout_seconds: int = 120
+    # Settlement model. ``"commit"`` (default) = Phase A; ``"guardian-fast"``
+    # = Phase B verify-before-prove. The merchant code is identical for
+    # both; the only difference is that on a guardian-fast 402 we acquire a
+    # server-issued ``serial_num`` from the facilitator beforehand.
+    settlement: str = "commit"
 
 
 @dataclass
@@ -81,7 +86,46 @@ def build_requirements(price: PriceTag) -> MidenPaymentRequirements:
             token_symbol=price.token_symbol,
             decimals=price.decimals,
             note_type=price.note_type,  # type: ignore[arg-type]
+            settlement=price.settlement,  # type: ignore[arg-type]
         ),
+    )
+
+
+def acquire_guardian_challenge(
+    requirements: MidenPaymentRequirements,
+    config: PaywallConfig,
+) -> MidenPaymentRequirements:
+    """For ``settlement: 'guardian-fast'``, asks the facilitator to issue a
+    server-generated ``serial_num`` and returns the requirements with
+    ``serial_num`` and ``guardian_url`` populated in ``extra``."""
+    body = {
+        "paymentRequirements": requirements.model_dump(by_alias=True, exclude_none=True),
+    }
+    client = config.httpx_client or httpx.Client(timeout=config.timeout_seconds)
+    owns_client = config.httpx_client is None
+    base = config.facilitator_url.rstrip("/")
+    try:
+        resp = client.post(f"{base}/guardian/challenge", json=body)
+    finally:
+        if owns_client:
+            client.close()
+    resp.raise_for_status()
+    data = resp.json()
+    new_extra = MidenExactExtra(
+        **{
+            **requirements.extra.model_dump(by_alias=False, exclude_none=True),
+            "serial_num": data["serialNum"],
+            "guardian_url": base,
+        }
+    )
+    return MidenPaymentRequirements(
+        scheme=requirements.scheme,
+        network=requirements.network,
+        amount=requirements.amount,
+        asset=requirements.asset,
+        pay_to=requirements.pay_to,
+        max_timeout_seconds=requirements.max_timeout_seconds,
+        extra=new_extra,
     )
 
 
@@ -150,11 +194,14 @@ def settle_with_facilitator(
         "paymentPayload": payload.model_dump(by_alias=True, exclude_none=True),
         "paymentRequirements": requirements.model_dump(by_alias=True, exclude_none=True),
     }
+    # Route to the right endpoint based on the negotiated settlement model.
+    settlement = getattr(requirements.extra, "settlement", "commit") or "commit"
+    path = "/guardian/settle" if settlement == "guardian-fast" else "/settle"
     client = config.httpx_client or httpx.Client(timeout=config.timeout_seconds)
     owns_client = config.httpx_client is None
     try:
         try:
-            resp = client.post(_facilitator_url(config.facilitator_url, "/settle"), json=body)
+            resp = client.post(_facilitator_url(config.facilitator_url, path), json=body)
         except httpx.HTTPError as e:
             return _SettleResult(ok=False, error=f"facilitator unreachable: {e}")
     finally:
@@ -192,11 +239,41 @@ def process_payment(
     config: PaywallConfig,
 ) -> PaymentOutcome:
     """Returns either ``Paid`` (call into the gated handler, attach the
-    Payment-Response header) or ``Reject`` (emit a 402 with this body)."""
+    Payment-Response header) or ``Reject`` (emit a 402 with this body).
+
+    For ``price.settlement == 'guardian-fast'`` and the first request (no
+    ``Payment-Signature`` header), this also acquires a server-generated
+    ``serial_num`` from the facilitator and embeds it in the 402's
+    ``extra.serial_num``.
+    """
     payload = try_decode_signature(signature_header)
     if payload is None:
-        return Reject(body=build_payment_required(price, resource))
-    requirements = build_requirements(price)
+        requirements = build_requirements(price)
+        if price.settlement == "guardian-fast":
+            try:
+                requirements = acquire_guardian_challenge(requirements, config)
+            except Exception as e:  # noqa: BLE001
+                # Surface the failure in the 402 body so the buyer sees an
+                # actionable error rather than a generic "verification
+                # failed".
+                return Reject(
+                    body=MidenPaymentRequired(
+                        x402_version=2,
+                        accepts=[requirements],
+                        resource=resource,
+                        error=f"failed to acquire guardian challenge: {e}",
+                    )
+                )
+        return Reject(
+            body=MidenPaymentRequired(
+                x402_version=2,
+                accepts=[requirements],
+                resource=resource,
+            )
+        )
+    # Retry path: use the requirements echoed back in `payload.accepted` so
+    # we honour the guardian challenge serial_num issued in the 402.
+    requirements = payload.accepted
     result = settle_with_facilitator(payload, requirements, config)
     if result.ok and result.settle is not None:
         return Paid(settle=result.settle)

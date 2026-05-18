@@ -36,7 +36,9 @@ pub type MidenSettleRequest = MidenVerifyRequest;
 mod tests {
     use super::*;
     use crate::network::miden_testnet;
-    use crate::scheme::{AssetTransferMethodTag, MidenExactPayload, NoteKind, PublicP2idPayload};
+    use crate::scheme::{
+        AssetTransferMethodTag, MidenExactPayload, NoteKind, PublicP2idPayload, SettlementKind,
+    };
     use x402_types::proto::v2::{PaymentRequired, ResourceInfo, X402Version2};
 
     fn sample_account() -> AccountIdHex {
@@ -60,6 +62,9 @@ mod tests {
                 token_symbol: "USDC".to_owned(),
                 decimals: 6,
                 note_type: NoteKind::Public,
+                settlement: SettlementKind::Commit,
+                guardian_url: None,
+                serial_num: None,
             },
         }
     }

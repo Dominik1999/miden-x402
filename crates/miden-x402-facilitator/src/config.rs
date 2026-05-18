@@ -9,6 +9,10 @@
 //! | `MIDEN_X402_RPC_TIMEOUT_MS` | `10000` | RPC timeout per call |
 //! | `MIDEN_X402_ALLOWED_FAUCETS` | `0x0a7d175ed63ec5200fb2ced86f6aa5` | Comma-separated faucet account IDs accepted as payment assets. Use `*` to allow any. |
 //! | `MIDEN_X402_FRESHNESS_BLOCKS` | `24` | Max blocks between note commitment and the current tip. Roughly two minutes at ~5s blocks. |
+//! | `MIDEN_X402_GUARDIAN_ENABLED` | `false` | Enable the `/guardian/*` Phase B endpoints |
+//! | `MIDEN_X402_REMOTE_PROVER_URL` | _unset_ | gRPC URL of the Miden remote prover. Required when `MIDEN_X402_GUARDIAN_ENABLED=true`. |
+//! | `MIDEN_X402_GUARDIAN_CHALLENGE_TTL_SECS` | `120` | TTL for issued `serial_num` challenges |
+//! | `MIDEN_X402_GUARDIAN_RESERVATION_TTL_SECS` | `60` | TTL for reserved input nullifiers |
 //! | `RUST_LOG` | `info` | Standard `tracing-subscriber` env filter |
 
 use std::env;
@@ -63,6 +67,38 @@ pub struct FacilitatorConfig {
     /// Maximum age, in blocks, between the note's commit block and the
     /// current chain tip.
     pub freshness_blocks: u32,
+    /// Guardian (Phase B) configuration. Off by default; the `/guardian/*`
+    /// endpoints return `501 Not Implemented` when [`GuardianConfig::enabled`]
+    /// is `false` and the rest of the facilitator behaves byte-for-byte
+    /// like Phase A.
+    pub guardian: GuardianConfig,
+}
+
+/// Phase B Guardian configuration.
+#[derive(Debug, Clone)]
+pub struct GuardianConfig {
+    /// Whether the `/guardian/*` HTTP endpoints are wired into the router.
+    pub enabled: bool,
+    /// gRPC URL of the remote prover. Required when `enabled = true`;
+    /// otherwise `/guardian/settle` returns `503 Service Unavailable`.
+    pub remote_prover_url: Option<String>,
+    /// TTL applied to each issued `serial_num` challenge. Should be ≥ the
+    /// `maxTimeoutSeconds` the merchant advertises in its 402.
+    pub challenge_ttl_secs: u64,
+    /// TTL applied to each reserved input nullifier. Defensive — the
+    /// success / failure paths normally release reservations explicitly.
+    pub reservation_ttl_secs: u64,
+}
+
+impl Default for GuardianConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            remote_prover_url: None,
+            challenge_ttl_secs: 120,
+            reservation_ttl_secs: 60,
+        }
+    }
 }
 
 impl FacilitatorConfig {
@@ -107,14 +143,58 @@ impl FacilitatorConfig {
             .transpose()?
             .unwrap_or(24);
 
+        let guardian = parse_guardian_config()?;
+
         Ok(Self {
             listen_addr,
             rpc_url,
             rpc_timeout_ms,
             allowed_faucets,
             freshness_blocks,
+            guardian,
         })
     }
+}
+
+fn parse_guardian_config() -> Result<GuardianConfig, ConfigError> {
+    let enabled = env::var("MIDEN_X402_GUARDIAN_ENABLED")
+        .ok()
+        .map(|raw| matches!(raw.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+
+    let remote_prover_url = env::var("MIDEN_X402_REMOTE_PROVER_URL").ok().and_then(|raw| {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() { None } else { Some(trimmed.to_owned()) }
+    });
+
+    let challenge_ttl_secs = env::var("MIDEN_X402_GUARDIAN_CHALLENGE_TTL_SECS")
+        .ok()
+        .map(|raw| {
+            raw.parse::<u64>().map_err(|e| ConfigError::Parse {
+                var: "MIDEN_X402_GUARDIAN_CHALLENGE_TTL_SECS",
+                source: Box::new(e),
+            })
+        })
+        .transpose()?
+        .unwrap_or(120);
+
+    let reservation_ttl_secs = env::var("MIDEN_X402_GUARDIAN_RESERVATION_TTL_SECS")
+        .ok()
+        .map(|raw| {
+            raw.parse::<u64>().map_err(|e| ConfigError::Parse {
+                var: "MIDEN_X402_GUARDIAN_RESERVATION_TTL_SECS",
+                source: Box::new(e),
+            })
+        })
+        .transpose()?
+        .unwrap_or(60);
+
+    Ok(GuardianConfig {
+        enabled,
+        remote_prover_url,
+        challenge_ttl_secs,
+        reservation_ttl_secs,
+    })
 }
 
 fn parse_allowlist(raw: &str) -> Result<FaucetAllowlist, ConfigError> {

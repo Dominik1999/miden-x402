@@ -20,9 +20,12 @@ import {
   decodePaymentRequiredHeader,
   decodePaymentResponseHeader,
   encodePaymentSignatureHeader,
+  type GuardianFastPayload,
+  type MidenExactPayload,
   type MidenPaymentPayload,
   type MidenPaymentRequired,
   type MidenPaymentRequirements,
+  type PrivateP2idPayload,
   type PublicP2idPayload,
   type SettleResponse,
 } from '@miden-x402/types';
@@ -80,24 +83,77 @@ export function withMidenX402(baseFetch: typeof fetch, opts: AgentOptions): type
       return response;
     }
 
-    const receipt = await opts.payer.payP2ID({
-      payTo: requirements.payTo,
-      asset: requirements.asset,
-      amount: requirements.amount,
-    });
+    const settlement = requirements.extra.settlement ?? 'commit';
+
+    let inner: MidenExactPayload;
+    if (settlement === 'guardian-fast') {
+      if (typeof opts.payer.payP2IDUnproven !== 'function') {
+        throw new Error(
+          'agent: requirements demand settlement="guardian-fast" but the configured Payer does not implement payP2IDUnproven',
+        );
+      }
+      if (!requirements.extra.serialNum) {
+        throw new Error(
+          'agent: guardian-fast requirements are missing extra.serialNum (the server-generated challenge)',
+        );
+      }
+      const receipt = await opts.payer.payP2IDUnproven({
+        payTo: requirements.payTo,
+        asset: requirements.asset,
+        amount: requirements.amount,
+        serialNum: requirements.extra.serialNum,
+      });
+      inner = {
+        noteType: 'guardianFast',
+        txInputs: receipt.txInputs,
+        signature: receipt.signature,
+        signedSummary: receipt.signedSummary,
+        expectedNoteBlob: receipt.expectedNoteBlob,
+        serialNum: requirements.extra.serialNum,
+        transactionId: receipt.transactionId,
+        sender: receipt.sender,
+        asset: requirements.asset,
+        amount: requirements.amount,
+      } satisfies GuardianFastPayload;
+    } else {
+      const receipt = await opts.payer.payP2ID({
+        payTo: requirements.payTo,
+        asset: requirements.asset,
+        amount: requirements.amount,
+        noteType: requirements.extra.noteType,
+      });
+      if (requirements.extra.noteType === 'private') {
+        if (!receipt.noteBlob) {
+          throw new Error(
+            'agent: payer returned no noteBlob for a private-note request; the Payer impl must export the canonical NoteFile for private payments',
+          );
+        }
+        inner = {
+          noteType: 'private',
+          noteBlob: receipt.noteBlob,
+          transactionId: receipt.transactionId,
+          sender: receipt.sender,
+          blockNum: receipt.blockNum,
+          asset: requirements.asset,
+          amount: requirements.amount,
+        } satisfies PrivateP2idPayload;
+      } else {
+        inner = {
+          noteType: 'public',
+          noteId: receipt.noteId,
+          transactionId: receipt.transactionId,
+          sender: receipt.sender,
+          blockNum: receipt.blockNum,
+          asset: requirements.asset,
+          amount: requirements.amount,
+        } satisfies PublicP2idPayload;
+      }
+    }
 
     const payload: MidenPaymentPayload = {
       x402Version: 2,
       accepted: requirements,
-      payload: {
-        noteType: 'public',
-        noteId: receipt.noteId,
-        transactionId: receipt.transactionId,
-        sender: receipt.sender,
-        blockNum: receipt.blockNum,
-        asset: requirements.asset,
-        amount: requirements.amount,
-      } satisfies PublicP2idPayload,
+      payload: inner,
     };
 
     opts.onPaymentBuilt?.(payload);
@@ -121,12 +177,14 @@ export function withMidenX402(baseFetch: typeof fetch, opts: AgentOptions): type
 }
 
 function pickMidenAccept(req: MidenPaymentRequired): MidenPaymentRequirements | null {
+  // Both public and private noteType variants are supported; the agent
+  // forwards the merchant's choice to the Payer.
   for (const accept of req.accepts) {
     if (
       accept.scheme === EXACT_SCHEME &&
       accept.network === MIDEN_TESTNET &&
       accept.extra.assetTransferMethod === ASSET_TRANSFER_METHOD_P2ID &&
-      accept.extra.noteType !== 'private'
+      (accept.extra.noteType === 'public' || accept.extra.noteType === 'private')
     ) {
       return accept;
     }

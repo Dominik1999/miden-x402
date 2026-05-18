@@ -36,6 +36,14 @@ class MidenExactExtra(_WireModel):
     token_symbol: str
     decimals: int
     note_type: Literal["public", "private"] = "public"
+    # Settlement model. ``"commit"`` (default) = settled-at-commit;
+    # ``"guardian-fast"`` = verify-before-prove via the Guardian endpoints.
+    settlement: Literal["commit", "guardian-fast"] = "commit"
+    # Only meaningful with settlement == "guardian-fast".
+    guardian_url: str | None = None
+    # Server-generated 32-byte hex Word. Only meaningful with
+    # settlement == "guardian-fast".
+    serial_num: str | None = None
 
 
 class MidenPaymentRequirements(_WireModel):
@@ -59,12 +67,50 @@ class PublicP2idPayload(_WireModel):
 
 
 class PrivateP2idPayload(_WireModel):
+    """Private-note payment payload.
+
+    Carries the canonical Miden ``NoteFile`` blob (base64-encoded) so the
+    facilitator can reconstruct the note off-chain and bind it to the
+    on-chain commitment by recomputing the note id. Other fields mirror
+    :class:`PublicP2idPayload` so the wire envelope is uniform across both
+    note types.
+    """
+
     note_type: Literal["private"] = "private"
     note_blob: str
+    transaction_id: str
+    sender: str
+    block_num: int
+    asset: str
+    amount: str
+
+
+class GuardianFastPayload(_WireModel):
+    """Guardian-fast payment payload.
+
+    Carries a signed-but-unproven transaction. The facilitator verifies the
+    Falcon signature offline, reserves input nullifiers, and proves +
+    submits the tx asynchronously. ``transaction_id`` is the pre-prove id.
+    There is no ``block_num`` field — the tx is not yet on chain at the
+    time the payload is constructed.
+    """
+
+    note_type: Literal["guardianFast"] = "guardianFast"
+    tx_inputs: str
+    # Base64 of miden_protocol::account::auth::Signature.
+    signature: str
+    # Base64 of miden_protocol::transaction::TransactionSummary.
+    signed_summary: str
+    expected_note_blob: str
+    serial_num: str
+    transaction_id: str
+    sender: str
+    asset: str
+    amount: str
 
 
 MidenExactPayload = Annotated[
-    Union[PublicP2idPayload, PrivateP2idPayload],
+    Union[PublicP2idPayload, PrivateP2idPayload, GuardianFastPayload],
     Field(discriminator="note_type"),
 ]
 

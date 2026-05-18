@@ -106,7 +106,7 @@ mod tests {
     use crate::network::miden_testnet;
     use crate::scheme::{
         AssetTransferMethodTag, ExactScheme, MidenExactExtra, MidenExactPayload, NoteKind,
-        PublicP2idPayload,
+        PublicP2idPayload, SettlementKind,
     };
     use x402_types::proto::v2::{PaymentRequired, ResourceInfo, X402Version2};
 
@@ -131,6 +131,9 @@ mod tests {
                 token_symbol: "USDC".to_owned(),
                 decimals: 6,
                 note_type: NoteKind::Public,
+                settlement: SettlementKind::Commit,
+                guardian_url: None,
+                serial_num: None,
             },
         }
     }

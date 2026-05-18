@@ -148,6 +148,32 @@ The buyer SDK MUST set `accepted` to **the exact same object** the merchant
 offered — including unknown future fields. The merchant compares the offered
 requirements against the echoed `accepted` to detect tampering.
 
+For `noteType: "private"`, the payload replaces `noteId` with `noteBlob`
+(base64-encoded `NoteFile`); all other receipt fields are identical:
+
+```json
+{
+  "x402Version": 2,
+  "accepted": { /* same shape; extra.noteType is "private" */ },
+  "payload": {
+    "noteType": "private",
+    "noteBlob": "bm90ZQEK...<base64 of canonical NoteFile>",
+    "transactionId": "0xbbbb...",
+    "sender":        "0x857b06519e91e3a54538791bdbb0e2",
+    "blockNum":      1234567,
+    "asset":         "0x0a7d175ed63ec5200fb2ced86f6aa5",
+    "amount":        "1000"
+  }
+}
+```
+
+The facilitator decodes the `NoteFile`, extracts recipient/asset from the
+off-chain note, recomputes the `noteId`, and binds the blob to the on-chain
+commitment by looking it up via `GetNotesById` — the result is
+`FetchedNote::Private(NoteHeader, NoteInclusionProof)` from which sender and
+block number are read. The same 11 verification rules apply; only the source
+of recipient/asset differs between the two note types.
+
 #### A.2.5 Merchant verifies via the facilitator
 
 The merchant POSTs to the facilitator (see section B). On success, the
@@ -179,6 +205,62 @@ the Miden settled-at-commit model that is the on-chain event that finalised
 the payment. The merchant never produces a new on-chain tx of its own
 (consumption of the note happens out of band, on the merchant's own
 schedule).
+
+#### A.2.7 Guardian-fast variant (verify-before-prove)
+
+When `accepts[*].extra.settlement == "guardian-fast"`, the buyer hands the
+facilitator a *signed but not proven* transaction; the facilitator verifies
+the Falcon signature offline, reserves the input nullifier(s), and proves +
+submits the tx asynchronously via a configured remote prover.
+
+The merchant's 402 acquires a server-issued `serial_num` from the
+facilitator's `POST /guardian/challenge` endpoint before emitting the
+response. The buyer must use that exact `serial_num` when constructing the
+P2ID note so the Guardian's pre-computed nullifier matches.
+
+402 `extra` shape for `guardian-fast`:
+
+```json
+{
+  "assetTransferMethod": "miden-p2id",
+  "tokenSymbol": "USDC",
+  "decimals": 6,
+  "noteType": "private",
+  "settlement": "guardian-fast",
+  "guardianUrl": "https://facilitator.miden.io",
+  "serialNum": "0x<32-byte server-generated word>"
+}
+```
+
+`Payment-Signature` payload variant for `guardian-fast` (base64-decoded):
+
+```json
+{
+  "noteType": "guardianFast",
+  "txInputs":         "<base64(TransactionInputs)>",
+  "signature":        "<base64(miden_protocol::account::auth::Signature)>",
+  "signedSummary":    "<base64(miden_protocol::transaction::TransactionSummary)>",
+  "expectedNoteBlob": "<base64(NoteFile::NoteDetails)>",
+  "serialNum":        "0x...",
+  "transactionId":    "0x...",
+  "sender":           "0x...",
+  "asset":            "0x...",
+  "amount":           "1000"
+}
+```
+
+`signedSummary` is the canonical `TransactionSummary` whose
+`to_commitment()` digest the buyer's Falcon signature authorizes. The
+facilitator binds it to `txInputs` (via `input_notes_commitment`) and to
+`expectedNoteBlob` (via membership in `output_notes`), then verifies the
+signature against the on-chain `PublicKeyCommitment` extracted from
+`txInputs.account()` storage.
+
+Trust model is identical to Base's x402 facilitator: the merchant trusts
+the Guardian's `Payment-Response` verification message and delivers the
+resource. On-chain inclusion is post-hoc; the returned `transaction` field
+is the post-prove `ProvenTransaction.id()`, NOT the pre-prove id echoed in
+`txInputs`.
 
 ### A.3 Error responses
 
@@ -265,6 +347,57 @@ Under settled-at-commit semantics `/settle` is idempotent and produces no
 new on-chain tx of its own: it just re-verifies and returns the buyer's
 create-note tx id.
 
+### B.2.7 Guardian endpoints (Phase B)
+
+The Guardian endpoints are mounted only when the facilitator is started
+with `MIDEN_X402_GUARDIAN_ENABLED=true`. When disabled (default), the
+endpoints below are absent from the router and the facilitator behaves
+byte-for-byte like Phase A.
+
+#### `POST /guardian/challenge`
+
+**Request body**
+
+```json
+{ "paymentRequirements": { /* MidenPaymentRequirements */ } }
+```
+
+**Success response** — `200 OK`
+
+```json
+{
+  "serialNum": "0x<32-byte hex>",
+  "expiresInSeconds": 120
+}
+```
+
+Issues a single-use server-generated `serial_num`. The merchant inlines
+this value into `extra.serialNum` and `extra.guardianUrl` of the 402
+response.
+
+#### `POST /guardian/verify`
+
+Same request body as `/verify`. The payload's `noteType` must be
+`"guardianFast"`. Performs the offline Falcon verification and reserves
+the input nullifiers, but does NOT prove or submit — the reservation is
+held until `/guardian/settle` is called (success) or the TTL sweeper
+releases it (timeout).
+
+Returns `VerifyResponse::Valid { payer }` on success.
+
+#### `POST /guardian/settle`
+
+Same request body. Runs the same checks as `/guardian/verify`, then
+forwards the verified `TransactionInputs` to the configured remote prover
+(`MIDEN_X402_REMOTE_PROVER_URL`) and submits the resulting
+`ProvenTransaction` to the Miden node. On success the reservation is
+promoted to consumed; on any failure it is released. Returns
+`SettleResponse::Success { payer, transaction, network }` where
+`transaction` is the post-prove `ProvenTransaction.id()`.
+
+Returns `503 Service Unavailable` if `MIDEN_X402_REMOTE_PROVER_URL` is
+unset; `501 Not Implemented` if `MIDEN_X402_GUARDIAN_ENABLED=false`.
+
 ### B.3 `GET /supported`
 
 ```json
@@ -290,26 +423,45 @@ create-note tx id.
 
 ## C. Verification rules (informative)
 
-The facilitator runs the following checks, fail-fast, in this order. See
+The facilitator runs the following checks, fail-fast, in this order, through
+a single note-type-agnostic pipeline. The only step that branches on
+`noteType` is rule 5 — recipient and asset come from the on-chain note for
+`public` and from the off-chain `noteBlob` for `private`, bound to chain
+state by recomputing the `noteId`. See
 [`crate::verifier`](../crates/miden-x402-facilitator/src/verifier.rs) for the
 canonical implementation.
 
 1. **Agreement check.** `paymentPayload.accepted` matches
-   `paymentRequirements` on `network`, `payTo`, `asset`, `amount`.
+   `paymentRequirements` on `network`, `payTo`, `asset`, `amount`, and
+   `extra.noteType`. The `payload.payload` discriminator must match
+   `extra.noteType`.
 2. **Network.** `requirements.network.namespace == "miden"`.
 3. **Allowlist.** `requirements.asset` is on the facilitator's faucet
    allowlist (env `MIDEN_X402_ALLOWED_FAUCETS`, default seeded to the
    testnet token).
-4. **Note kind.** `paymentPayload.payload.noteType == "public"`. Private
-   notes return `unsupported_scheme` until Phase 2.
-5. **Resolve note.** `get_notes_by_id` returns a committed `FetchedNote::Public`.
+4. **Note kind.** Both `"public"` and `"private"` are supported.
+5. **Resolve note.**
+   - *Public:* `get_notes_by_id` returns `FetchedNote::Public(Note, proof)`;
+     recipient, asset, sender, and block num are read directly from the
+     on-chain note.
+   - *Private:* base64-decode `noteBlob` → `NoteFile`. Accept only
+     `NoteDetails` / `NoteWithProof` variants (a bare `NoteId` is rejected).
+     Recompute the `noteId` and call `get_notes_by_id`; expect
+     `FetchedNote::Private(NoteHeader, proof)`. Recipient and asset come
+     from the off-chain `NoteDetails`; sender and block num come from the
+     on-chain header. The `noteId` equality is the cryptographic bind —
+     any tampering with the off-chain note changes the commitment and
+     misses on the lookup.
 6. **P2ID script root.** `note.recipient().script().root() == P2idNote::script_root()`.
 7. **Recipient.** Extracted via `P2idNoteStorage::try_from(note.recipient().storage().items())`,
    compared to `requirements.payTo`.
 8. **Asset.** Exactly one fungible asset whose faucet equals
    `requirements.asset` and amount equals `requirements.amount`.
-9. **Sender.** `note.metadata().sender() == paymentPayload.payload.sender`.
-10. **Nullifier.** Not yet in the consumed set.
+9. **Sender.** On-chain `metadata().sender() == paymentPayload.payload.sender`.
+10. **Nullifier.** Not yet in the consumed set. For private notes, the
+    nullifier is recomputed off-chain from the `NoteFile` (a function of
+    serial_num, script_root, storage_commitment, asset_commitment — no
+    consumer key needed) and checked via the same `check_nullifiers` RPC.
 11. **Freshness.** `currentBlockNum - note.blockNum <= MIDEN_X402_FRESHNESS_BLOCKS`.
 
 Any violation maps to a canonical x402 [`ErrorReason`]; the HTTP status code
@@ -328,6 +480,7 @@ is `400` for client-side failures and `500` for unexpected node failures.
 | Node SDK (merchant + agent) | M4b — shipped |
 | Python SDK (merchant) | M5 — shipped |
 | Quickstart README + scheme + deploy docs | M6 — shipped |
-| Private notes (`noteType: "private"`) | Phase 2 |
+| Private notes (`noteType: "private"`) | M7 — shipped |
+| Guardian verify-before-prove (`settlement: "guardian-fast"`) | M8 — shipped (verify path; settle path requires WASM SDK extensions to drive the buyer side end-to-end) |
 
 [`ErrorReason`]: https://docs.rs/x402-types/latest/x402_types/proto/enum.ErrorReason.html

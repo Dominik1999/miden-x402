@@ -70,6 +70,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             token_symbol: env.token_symbol.clone(),
             decimals: env.decimals,
             note_type: NoteKind::Public,
+            settlement: miden_x402_types::SettlementKind::Commit,
+            guardian_url: None,
+            serial_num: None,
         },
     };
 
@@ -95,6 +98,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         rpc_timeout_ms: DEFAULT_RPC_TIMEOUT_MS,
         allowed_faucets: FaucetAllowlist::Any,
         freshness_blocks: env.freshness_blocks,
+        guardian: miden_x402_facilitator::config::GuardianConfig::default(),
     };
 
     info!("calling verifier::verify against live testnet");

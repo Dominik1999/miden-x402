@@ -19,7 +19,13 @@
 
 import type { HexId } from '@miden-x402/types';
 
-import type { Payer, P2idPaymentReceipt, P2idPaymentRequest } from './payer.js';
+import type {
+  Payer,
+  P2idPaymentReceipt,
+  P2idPaymentRequest,
+  P2idUnprovenReceipt,
+  P2idUnprovenRequest,
+} from './payer.js';
 
 export interface WasmSdkPayerOptions {
   /** Buyer (sender) account id this payer pays from. */
@@ -69,6 +75,7 @@ export function createWasmSdkPayer(opts: WasmSdkPayerOptions): Payer {
   return {
     async payP2ID(request: P2idPaymentRequest): Promise<P2idPaymentReceipt> {
       const client = await getClient();
+      const noteType = request.noteType ?? 'public';
 
       let submitted: SubmittedTx;
       try {
@@ -77,7 +84,7 @@ export function createWasmSdkPayer(opts: WasmSdkPayerOptions): Payer {
           target: request.payTo,
           faucet: request.asset,
           amount: BigInt(request.amount),
-          noteType: 'public',
+          noteType,
         });
       } catch (e) {
         throw new WasmSdkPayerError(
@@ -97,7 +104,59 @@ export function createWasmSdkPayer(opts: WasmSdkPayerOptions): Payer {
         pollMs,
       });
 
-      return { noteId, transactionId, sender, blockNum };
+      // For private notes, export the canonical NoteFile blob from the SDK
+      // so the agent can put it into `PrivateP2idPayload.noteBlob`. The exact
+      // SDK call signature is the M4 risk-gate validated one; if the SDK
+      // renames the export method, update this single line.
+      let noteBlob: string | undefined;
+      if (noteType === 'private') {
+        if (typeof client.exportNoteFile !== 'function') {
+          throw new WasmSdkPayerError(
+            "@miden-sdk/miden-sdk did not export `exportNoteFile`; the installed version does not support private-note export. Pin to a version that does.",
+          );
+        }
+        try {
+          noteBlob = await client.exportNoteFile(noteId, 'NoteDetails');
+        } catch (e) {
+          throw new WasmSdkPayerError(
+            `failed to export private NoteFile via @miden-sdk/miden-sdk: ${(e as Error).message}`,
+            { cause: e },
+          );
+        }
+      }
+
+      return { noteId, transactionId, sender, blockNum, noteBlob };
+    },
+
+    async payP2IDUnproven(request: P2idUnprovenRequest): Promise<P2idUnprovenReceipt> {
+      const client = await getClient();
+      if (typeof client.buildSignedUnprovenP2id !== 'function') {
+        throw new WasmSdkPayerError(
+          "@miden-sdk/miden-sdk did not export `buildSignedUnprovenP2id`; the installed version does not support the Guardian (verify-before-prove) flow. Pin to a version that does.",
+        );
+      }
+      try {
+        const built = await client.buildSignedUnprovenP2id({
+          sender: opts.buyerAccountId,
+          target: request.payTo,
+          faucet: request.asset,
+          amount: BigInt(request.amount),
+          serialNum: request.serialNum,
+        });
+        return {
+          txInputs: built.txInputs,
+          signature: built.signature,
+          signedSummary: built.signedSummary,
+          expectedNoteBlob: built.expectedNoteBlob,
+          transactionId: built.transactionId,
+          sender: built.sender ?? opts.buyerAccountId,
+        };
+      } catch (e) {
+        throw new WasmSdkPayerError(
+          `failed to build signed unproven P2ID tx via @miden-sdk/miden-sdk: ${(e as Error).message}`,
+          { cause: e },
+        );
+      }
     },
   };
 }
@@ -122,6 +181,40 @@ interface MidenClientLike {
   }): Promise<SubmittedTx>;
 
   getNote(noteId: HexId): Promise<CommittedNote | null>;
+
+  /**
+   * Exports a committed note as a base64-encoded canonical NoteFile blob.
+   * Required for private-note payments; optional for the public path.
+   * Mirror of `OutputNoteRecord::into_note_file(NoteExportType::NoteDetails)`
+   * in the Rust facilitator's `pay_and_verify` binary.
+   */
+  exportNoteFile?(noteId: HexId, exportType: 'NoteId' | 'NoteDetails' | 'NoteWithProof'): Promise<string>;
+
+  /**
+   * Phase B / Guardian: builds a private P2ID note using the supplied
+   * server-issued `serialNum`, runs the tx locally to compute the
+   * `TransactionSummary`, signs that summary, but does NOT prove or submit.
+   * Returns the canonical blobs the Guardian needs to verify offline and
+   * later prove + submit.
+   *
+   * The WASM SDK version installed by `@miden-x402/agent` consumers must
+   * expose this method for the Guardian flow to work; older versions
+   * throw `WasmSdkPayerError`.
+   */
+  buildSignedUnprovenP2id?(args: {
+    sender: HexId;
+    target: HexId;
+    faucet: HexId;
+    amount: bigint;
+    serialNum: HexId;
+  }): Promise<{
+    txInputs: string;
+    signature: string;
+    signedSummary: string;
+    expectedNoteBlob: string;
+    transactionId: HexId;
+    sender?: HexId;
+  }>;
 }
 
 async function loadMidenSdk(storePath: string): Promise<MidenClientLike> {

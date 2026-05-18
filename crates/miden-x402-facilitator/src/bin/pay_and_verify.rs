@@ -5,13 +5,20 @@
 //!
 //!   1. Sync local state.
 //!   2. Consume the faucet's unspent P2ID note targeting BUYER and create
-//!      a new public P2ID note paying MERCHANT 1000 atomic units, all in
-//!      one transaction.
+//!      a new public or private P2ID note (per `--note-type`) paying MERCHANT
+//!      1000 atomic units, all in one transaction.
 //!   3. Wait for the create-note tx to commit.
 //!   4. Build the `MidenPaymentRequirements` + `MidenPaymentPayload` that
 //!      the merchant would have received from the buyer in the real x402
 //!      flow, then run the facilitator's `verify` + `settle` against live
 //!      Miden testnet via `GrpcMidenNode::testnet`.
+//!
+//! For `--note-type private`, the buyer's NoteFile is exported via the
+//! Miden client's `into_note_file(NoteExportType::NoteDetails)`, serialised,
+//! base64-encoded, and placed in `PrivateP2idPayload.note_blob`. The
+//! facilitator decodes the blob, recomputes the note id, binds it to the
+//! on-chain commitment, and verifies recipient/asset/amount/sender/nullifier
+//! against the same rules as the public path.
 //!
 //! Build/run in `--release` — `miden-client` 0.14.8 trips a debug-only
 //! sync assertion that does not occur in release mode.
@@ -21,13 +28,16 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use miden_client::Serializable;
 use miden_client::DebugMode;
 use miden_client::account::AccountId;
 use miden_client::asset::{Asset, FungibleAsset};
 use miden_client::builder::ClientBuilder;
 use miden_client::keystore::FilesystemKeyStore;
 use miden_client::note::NoteId;
-use miden_client::store::{NoteFilter, OutputNoteRecord, Store};
+use miden_client::store::{NoteExportType, NoteFilter, OutputNoteRecord, Store};
 use miden_client::transaction::TransactionRequestBuilder;
 use miden_client_sqlite_store::SqliteStore;
 use miden_protocol::note::{NoteAttachment, NoteType};
@@ -37,8 +47,8 @@ use miden_x402_facilitator::{FacilitatorConfig, GrpcMidenNode};
 use miden_x402_facilitator::verifier;
 use miden_x402_types::{
     AccountIdHex, AssetTransferMethodTag, ExactScheme, MidenExactExtra, MidenExactPayload,
-    MidenPaymentPayload, MidenPaymentRequirements, NoteIdHex, NoteKind, PublicP2idPayload,
-    TransactionIdHex, miden_testnet,
+    MidenPaymentPayload, MidenPaymentRequirements, NoteIdHex, NoteKind, PrivateP2idPayload,
+    PublicP2idPayload, TransactionIdHex, miden_testnet,
 };
 use serde::Deserialize;
 use tracing::{info, warn};
@@ -73,6 +83,13 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let cli_note_type = parse_note_type_arg()?;
+    let note_type_str = match cli_note_type {
+        NoteType::Public => "public",
+        NoteType::Private => "private",
+    };
+    info!(note_type = note_type_str, "starting pay_and_verify flow");
+
     let state = PathBuf::from(STATE_DIR);
     let store_path = state.join("store.sqlite3");
     let keys_dir = state.join("keys");
@@ -157,12 +174,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         buyer,
         merchant,
         vec![asset],
-        NoteType::Public,
+        cli_note_type,
         NoteAttachment::default(),
         client.rng(),
     )?;
     let merchant_note_id = p2id.id();
-    info!(merchant_note_id = %merchant_note_id.to_hex(), "constructed merchant-targeted P2ID");
+    info!(
+        merchant_note_id = %merchant_note_id.to_hex(),
+        note_type = note_type_str,
+        "constructed merchant-targeted P2ID",
+    );
 
     let request = builder.own_output_notes(vec![p2id]).build()?;
 
@@ -174,7 +195,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         merchant_note_id = %merchant_note_id.to_hex(),
         "waiting for merchant note to commit"
     );
-    let commit_block = wait_for_commit(&mut client, merchant_note_id).await?;
+    let (commit_block, output_record) =
+        wait_for_commit_with_record(&mut client, merchant_note_id).await?;
     info!(block_num = commit_block, "merchant note committed");
 
     // Build the x402 wire types.
@@ -184,6 +206,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let note_id_hex: NoteIdHex = merchant_note_id.to_hex().parse()?;
     let tx_id_hex: TransactionIdHex = tx_id.to_hex().parse()?;
     let amount_str = DEFAULT_AMOUNT.to_string();
+
+    let kind = match cli_note_type {
+        NoteType::Public => NoteKind::Public,
+        NoteType::Private => NoteKind::Private,
+    };
 
     let requirements = MidenPaymentRequirements {
         scheme: ExactScheme,
@@ -196,20 +223,46 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             asset_transfer_method: AssetTransferMethodTag,
             token_symbol: "USDC".to_owned(),
             decimals: 6,
-            note_type: NoteKind::Public,
+            note_type: kind,
+            settlement: miden_x402_types::SettlementKind::Commit,
+            guardian_url: None,
+            serial_num: None,
         },
     };
 
-    let payload = MidenPaymentPayload {
-        accepted: requirements.clone(),
-        payload: MidenExactPayload::Public(PublicP2idPayload {
+    let inner_payload = match cli_note_type {
+        NoteType::Public => MidenExactPayload::Public(PublicP2idPayload {
             note_id: note_id_hex,
             transaction_id: tx_id_hex,
             sender: buyer_hex,
             block_num: commit_block,
             asset: faucet_hex,
-            amount: amount_str,
+            amount: amount_str.clone(),
         }),
+        NoteType::Private => {
+            // Export the canonical NoteFile blob the buyer would send in
+            // PrivateP2idPayload.note_blob. The merchant never sees the body
+            // on chain — only the commitment.
+            let note_file = output_record.into_note_file(&NoteExportType::NoteDetails)?;
+            let blob_b64 = BASE64.encode(note_file.to_bytes());
+            info!(
+                blob_bytes_b64_len = blob_b64.len(),
+                "exported private NoteFile blob (NoteDetails)",
+            );
+            MidenExactPayload::Private(PrivateP2idPayload {
+                note_blob: blob_b64,
+                transaction_id: tx_id_hex,
+                sender: buyer_hex,
+                block_num: commit_block,
+                asset: faucet_hex,
+                amount: amount_str.clone(),
+            })
+        }
+    };
+
+    let payload = MidenPaymentPayload {
+        accepted: requirements.clone(),
+        payload: inner_payload,
         resource: None,
         x402_version: X402Version2,
         extensions: None,
@@ -223,6 +276,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         rpc_timeout_ms: RPC_TIMEOUT_MS,
         allowed_faucets: FaucetAllowlist::Any,
         freshness_blocks: FRESHNESS_BLOCKS,
+        guardian: miden_x402_facilitator::config::GuardianConfig::default(),
     };
 
     info!("running facilitator verify against live testnet");
@@ -252,17 +306,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     Ok(())
 }
 
-async fn wait_for_commit(
+/// Polls the local store until the buyer's create-note transaction is
+/// committed, then returns `(block_num, record)`. The record is needed so
+/// that the private path can serialise a `NoteFile::NoteDetails` for
+/// `PrivateP2idPayload.note_blob`.
+async fn wait_for_commit_with_record(
     client: &mut miden_client::Client<FilesystemKeyStore>,
     note_id: NoteId,
-) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(u32, OutputNoteRecord), Box<dyn std::error::Error + Send + Sync>> {
     let deadline = std::time::Instant::now() + COMMIT_TIMEOUT;
     loop {
         client.sync_state().await?;
         let records = client.get_output_notes(NoteFilter::Unique(note_id)).await?;
         if let Some(record) = records.into_iter().next() {
             if let Some(block_num) = output_note_commit_block(&record) {
-                return Ok(block_num);
+                return Ok((block_num, record));
             }
         }
         if std::time::Instant::now() >= deadline {
@@ -280,6 +338,72 @@ async fn wait_for_commit(
 
 fn output_note_commit_block(record: &OutputNoteRecord) -> Option<u32> {
     record.inclusion_proof().map(|p| p.location().block_num().as_u32())
+}
+
+/// Parses `--note-type public|private` from CLI args. Defaults to `public`
+/// for backward compatibility with the original M4a smoke harness.
+fn parse_note_type_arg() -> Result<NoteType, Box<dyn std::error::Error + Send + Sync>> {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--note-type" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "missing value for --note-type".to_string())?;
+                return parse_note_type_value(&value);
+            }
+            other if other.starts_with("--note-type=") => {
+                let value = &other["--note-type=".len()..];
+                return parse_note_type_value(value);
+            }
+            "--settlement" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "missing value for --settlement".to_string())?;
+                if value == "guardian-fast" {
+                    return Err(guardian_fast_not_implemented_msg().into());
+                }
+            }
+            other if other.starts_with("--settlement=") => {
+                let value = &other["--settlement=".len()..];
+                if value == "guardian-fast" {
+                    return Err(guardian_fast_not_implemented_msg().into());
+                }
+            }
+            "--help" | "-h" => {
+                println!(
+                    "usage: miden-x402-pay-and-verify [--note-type public|private] \
+                     [--settlement commit|guardian-fast]\n\
+                     default: --note-type public --settlement commit\n\
+                     note: --settlement guardian-fast is not yet implementable from \
+                     this binary; see docs/protocol.md."
+                );
+                std::process::exit(0);
+            }
+            _ => {}
+        }
+    }
+    Ok(NoteType::Public)
+}
+
+fn guardian_fast_not_implemented_msg() -> String {
+    "--settlement guardian-fast requires WASM SDK methods that are not yet exposed by \
+     `miden-client` 0.14.x (build-sign-without-prove + TransactionSummary export + \
+     high-level Signature export). See `docs/protocol.md` §A.2.7 for the wire \
+     contract; the Guardian endpoints `/guardian/verify` and `/guardian/settle` are \
+     already implemented and ready to accept GuardianFastPayload from any client \
+     that can produce one."
+        .to_owned()
+}
+
+fn parse_note_type_value(
+    value: &str,
+) -> Result<NoteType, Box<dyn std::error::Error + Send + Sync>> {
+    match value {
+        "public" => Ok(NoteType::Public),
+        "private" => Ok(NoteType::Private),
+        other => Err(format!("invalid --note-type '{other}' (expected public|private)").into()),
+    }
 }
 
 fn init_tracing() {

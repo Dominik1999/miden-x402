@@ -41,6 +41,14 @@ price = PriceTag(
     token_symbol="USDC",
     decimals=6,
 )
+price_private = PriceTag(
+    amount=AMOUNT,
+    asset=ASSET,
+    pay_to=PAY_TO,
+    token_symbol="USDC",
+    decimals=6,
+    note_type="private",
+)
 config = PaywallConfig(facilitator_url=FACILITATOR_URL)
 
 app = Flask(__name__)
@@ -50,10 +58,22 @@ app = Flask(__name__)
 @paywall(
     price=price,
     config=config,
-    description="current weather",
+    description="current weather (public note)",
     mime_type="application/json",
 )
 def weather():
+    return jsonify(temperature=21.5, city="Istanbul")
+
+
+# Private-note variant. Same merchant code path; only ``note_type`` differs.
+@app.get("/weather-private")
+@paywall(
+    price=price_private,
+    config=config,
+    description="current weather (private note)",
+    mime_type="application/json",
+)
+def weather_private():
     return jsonify(temperature=21.5, city="Istanbul")
 
 

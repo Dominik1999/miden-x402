@@ -43,11 +43,14 @@ serde              = { workspace = true }
 serde_json         = { workspace = true }
 thiserror          = { workspace = true }
 async-trait        = { workspace = true }
+base64             = { workspace = true }
 
 miden-client       = { workspace = true }
 miden-client-sqlite-store = "0.14"
 miden-protocol     = "0.14"
 miden-standards    = { workspace = true }
+miden-remote-prover-client = "0.14"
+miden-crypto       = "0.23"
 rand               = "0.9"
 
 axum               = { workspace = true }

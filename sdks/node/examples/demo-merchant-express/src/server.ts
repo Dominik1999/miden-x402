@@ -32,7 +32,30 @@ app.get(
       tokenSymbol: 'USDC',
       decimals: 6,
     },
-    description: 'current weather',
+    description: 'current weather (public note)',
+    mimeType: 'application/json',
+  }),
+  (_req, res) => {
+    res.json({ temperature: 21.5, city: 'Istanbul' });
+  },
+);
+
+// Private-note variant of the same paywall. Same merchant code path; only
+// the `PriceTag.noteType` differs. The agent picks up `noteType: 'private'`
+// from the merchant's PaymentRequired and routes the payer accordingly.
+app.get(
+  '/weather-private',
+  paywall({
+    facilitatorUrl: FACILITATOR_URL,
+    price: {
+      amount: AMOUNT,
+      asset: ASSET,
+      payTo: PAY_TO,
+      tokenSymbol: 'USDC',
+      decimals: 6,
+      noteType: 'private',
+    },
+    description: 'current weather (private note)',
     mimeType: 'application/json',
   }),
   (_req, res) => {
@@ -46,6 +69,7 @@ app.listen(PORT, () => {
   console.log(`  asset=${ASSET}`);
   console.log(`  amount=${AMOUNT}`);
   console.log(`  facilitator=${FACILITATOR_URL}`);
+  console.log(`  routes: /weather (public)  /weather-private (private)`);
 });
 
 function required(key: string): string {

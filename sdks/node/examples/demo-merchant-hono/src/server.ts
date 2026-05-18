@@ -26,12 +26,31 @@ app.use(
       tokenSymbol: 'USDC',
       decimals: 6,
     },
-    description: 'current weather',
+    description: 'current weather (public note)',
+    mimeType: 'application/json',
+  }),
+);
+
+// Private-note variant. Same merchant code path; only `noteType` differs.
+app.use(
+  '/weather-private',
+  paywall({
+    facilitatorUrl: FACILITATOR_URL,
+    price: {
+      amount: AMOUNT,
+      asset: ASSET,
+      payTo: PAY_TO,
+      tokenSymbol: 'USDC',
+      decimals: 6,
+      noteType: 'private',
+    },
+    description: 'current weather (private note)',
     mimeType: 'application/json',
   }),
 );
 
 app.get('/weather', (c) => c.json({ temperature: 21.5, city: 'Istanbul' }));
+app.get('/weather-private', (c) => c.json({ temperature: 21.5, city: 'Istanbul' }));
 
 serve({ fetch: app.fetch, port: PORT }, () => {
   console.log(`demo-merchant-hono listening on http://localhost:${PORT}`);
@@ -39,6 +58,7 @@ serve({ fetch: app.fetch, port: PORT }, () => {
   console.log(`  asset=${ASSET}`);
   console.log(`  amount=${AMOUNT}`);
   console.log(`  facilitator=${FACILITATOR_URL}`);
+  console.log(`  routes: /weather (public)  /weather-private (private)`);
 });
 
 function required(key: string): string {

@@ -40,11 +40,23 @@ export type AssetTransferMethodTag = typeof ASSET_TRANSFER_METHOD_P2ID;
 
 export type NoteKind = 'public' | 'private';
 
+/**
+ * Settlement model. `commit` (default) = settled-at-commit; `guardian-fast`
+ * = verify-before-prove via the Guardian facilitator endpoints.
+ */
+export type SettlementKind = 'commit' | 'guardian-fast';
+
 export interface MidenExactExtra {
   assetTransferMethod: AssetTransferMethodTag;
   tokenSymbol: string;
   decimals: number;
   noteType: NoteKind;
+  /** Optional. Defaults to `'commit'` when absent. */
+  settlement?: SettlementKind;
+  /** Required when `settlement: 'guardian-fast'`. URL of the Guardian facilitator. */
+  guardianUrl?: string;
+  /** Required when `settlement: 'guardian-fast'`. Server-generated 32-byte hex word. */
+  serialNum?: HexId;
 }
 
 export interface MidenPaymentRequirements {
@@ -67,14 +79,67 @@ export interface PublicP2idPayload {
   amount: DecimalAmount;
 }
 
-/** Phase-2 variant; facilitators reject with `unsupported_scheme` today. */
+/**
+ * Private-note payment payload.
+ *
+ * Carries the canonical Miden `NoteFile` (base64-encoded) so the facilitator
+ * can reconstruct the note off-chain and bind it to the on-chain commitment
+ * by recomputing the note id. The remaining fields mirror
+ * {@link PublicP2idPayload} so the wire envelope is uniform across both note
+ * types and the merchant can produce the same `SettleResponse::Success`
+ * shape regardless of `noteType`.
+ */
 export interface PrivateP2idPayload {
   noteType: 'private';
   /** Base64-encoded canonical NoteFile blob. */
   noteBlob: string;
+  transactionId: HexId;
+  sender: HexId;
+  blockNum: number;
+  asset: HexId;
+  amount: DecimalAmount;
 }
 
-export type MidenExactPayload = PublicP2idPayload | PrivateP2idPayload;
+/**
+ * Guardian-fast payment payload.
+ *
+ * Carries a signed-but-unproven Miden transaction. The facilitator verifies
+ * the Falcon signature offline, reserves the input nullifiers, and proves +
+ * submits the tx asynchronously. Unlike the commit variants, there is no
+ * `blockNum` because the tx has not yet been included in a block at
+ * payload-construction time, and `transactionId` is the pre-prove id —
+ * the post-prove id is the one returned by `/guardian/settle`.
+ */
+export interface GuardianFastPayload {
+  noteType: 'guardianFast';
+  /** Base64-encoded canonical TransactionInputs. */
+  txInputs: string;
+  /**
+   * Base64-encoded `miden_protocol::account::auth::Signature` over the
+   * `TransactionSummary::to_commitment()` digest. Carried as a separate
+   * field because the advice-map encoding inside TransactionInputs is the
+   * stack-reversed prepared form, which can't be inverted back to the
+   * high-level Signature needed for offline verification.
+   */
+  signature: string;
+  /**
+   * Base64-encoded `miden_protocol::transaction::TransactionSummary` — the
+   * value whose `.toCommitment()` the buyer signed. The Guardian binds it
+   * to `txInputs` (via input-notes commitment) and to `expectedNoteBlob`
+   * (via output-notes commitment) before verifying the signature.
+   */
+  signedSummary: string;
+  /** Base64-encoded NoteFile::NoteDetails for the expected output note. */
+  expectedNoteBlob: string;
+  /** Echo of `requirements.extra.serialNum`. */
+  serialNum: HexId;
+  transactionId: HexId;
+  sender: HexId;
+  asset: HexId;
+  amount: DecimalAmount;
+}
+
+export type MidenExactPayload = PublicP2idPayload | PrivateP2idPayload | GuardianFastPayload;
 
 // ---------- Top-level envelopes ----------
 

@@ -14,11 +14,12 @@
 
 pub mod config;
 pub mod error;
+pub mod guardian;
 pub mod handlers;
 pub mod node;
 pub mod verifier;
 
-pub use config::FacilitatorConfig;
+pub use config::{FacilitatorConfig, GuardianConfig};
 pub use error::FacilitatorError;
 pub use handlers::{AppState, build_router};
 pub use node::{GrpcMidenNode, MidenNode, NoteSnapshot};

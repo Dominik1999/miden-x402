@@ -2802,9 +2802,12 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
+ "base64",
  "miden-client",
  "miden-client-sqlite-store",
+ "miden-crypto",
  "miden-protocol",
+ "miden-remote-prover-client",
  "miden-standards",
  "miden-x402-types",
  "rand 0.9.4",

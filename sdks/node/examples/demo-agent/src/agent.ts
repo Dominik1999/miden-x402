@@ -1,6 +1,11 @@
 /**
  * Demo agent CLI. Pays the demo merchant via the M4b agent wrapper.
  *
+ * The note type (public / private) is chosen by the merchant via
+ * `PaymentRequirements.extra.noteType`; the agent just forwards the choice
+ * to the payer. Point `TARGET_URL` at `/weather` for public or
+ * `/weather-private` for private.
+ *
  * Two modes:
  *
  *   1. WASM-SDK mode (default once `@miden-sdk/miden-sdk` is installed):
@@ -13,6 +18,7 @@
  *      AGENT_MOCK=1 TARGET_URL=http://localhost:3000/weather \
  *      MOCK_NOTE_ID=0x...  MOCK_TX_ID=0x... MOCK_SENDER=0x...  \
  *      MOCK_BLOCK_NUM=1000 \
+ *      [MOCK_NOTE_BLOB=...]   # required when hitting a private-note route
  *      pnpm --filter demo-agent start
  *
  * Mock mode lets you exercise the full Express/Hono merchant + facilitator
@@ -67,12 +73,23 @@ function required(key: string): string {
 
 function mockPayer(): Payer {
   return {
-    async payP2ID(_req: P2idPaymentRequest): Promise<P2idPaymentReceipt> {
+    async payP2ID(req: P2idPaymentRequest): Promise<P2idPaymentReceipt> {
+      let noteBlob: string | undefined;
+      if (req.noteType === 'private') {
+        const blob = process.env.MOCK_NOTE_BLOB;
+        if (!blob) {
+          throw new Error(
+            'agent mock: MOCK_NOTE_BLOB is required when the merchant requests noteType=private',
+          );
+        }
+        noteBlob = blob;
+      }
       return {
         noteId: required('MOCK_NOTE_ID'),
         transactionId: required('MOCK_TX_ID'),
         sender: required('MOCK_SENDER'),
         blockNum: Number(required('MOCK_BLOCK_NUM')),
+        noteBlob,
       };
     },
   };

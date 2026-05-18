@@ -39,6 +39,14 @@ price = PriceTag(
     token_symbol="USDC",
     decimals=6,
 )
+price_private = PriceTag(
+    amount=AMOUNT,
+    asset=ASSET,
+    pay_to=PAY_TO,
+    token_symbol="USDC",
+    decimals=6,
+    note_type="private",
+)
 config = PaywallConfig(facilitator_url=FACILITATOR_URL)
 
 app = FastAPI()
@@ -52,11 +60,33 @@ install_paywall_exception_handler(app)
             paywall(
                 price=price,
                 config=config,
-                description="current weather",
+                description="current weather (public note)",
                 mime_type="application/json",
             )
         )
     ],
 )
 def weather() -> dict[str, object]:
+    return {"temperature": 21.5, "city": "Istanbul"}
+
+
+# Private-note variant of the same paywall. Same merchant code path; only the
+# ``PriceTag.note_type`` differs. The buyer's agent picks up the
+# ``noteType: 'private'`` hint from the 402 response and routes its payer
+# accordingly. The facilitator runs the same unified verification pipeline
+# for both note types.
+@app.get(
+    "/weather-private",
+    dependencies=[
+        Depends(
+            paywall(
+                price=price_private,
+                config=config,
+                description="current weather (private note)",
+                mime_type="application/json",
+            )
+        )
+    ],
+)
+def weather_private() -> dict[str, object]:
     return {"temperature": 21.5, "city": "Istanbul"}

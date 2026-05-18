@@ -137,7 +137,8 @@ For a live-testnet smoke against a real on-chain P2ID note, see
 | Node SDK (merchant + agent + demos) | M4b | shipped |
 | Python SDK (merchant + demos) | M5 | shipped |
 | Quickstart + deploy + scheme docs | M6 | shipped |
-| Private P2ID notes | Phase 2 (M7) | planned |
+| Private P2ID notes (unified verifier; `noteType: "private"`) | M7 | shipped |
+| Guardian verify-before-prove (`settlement: "guardian-fast"`) | M8 | shipped (server-side; full E2E requires WASM SDK extensions) |
 
 ## License
 

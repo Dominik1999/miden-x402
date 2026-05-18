@@ -38,8 +38,9 @@ pub use network::{
     MAINNET_REFERENCE, MIDEN_NAMESPACE, TESTNET_REFERENCE, miden_mainnet, miden_testnet,
 };
 pub use scheme::{
-    ASSET_TRANSFER_METHOD_P2ID, AssetTransferMethodTag, ExactScheme, MidenExactExtra,
-    MidenExactPayload, NoteKind, PrivateP2idPayload, PublicP2idPayload,
+    ASSET_TRANSFER_METHOD_P2ID, AssetTransferMethodTag, ExactScheme, GuardianFastPayload,
+    MidenExactExtra, MidenExactPayload, NoteKind, PrivateP2idPayload, PublicP2idPayload,
+    SettlementKind,
 };
 
 // Re-export the upstream x402 v2 types we share with the rest of the

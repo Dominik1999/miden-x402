@@ -6,3 +6,4 @@ sdks/python/.venv/
 sdks/python/**/__pycache__/
 sdks/python/*.egg-info/
 sdks/python/src/*.egg-info/
+ideas

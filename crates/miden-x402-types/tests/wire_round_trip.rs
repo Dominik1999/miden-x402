@@ -22,10 +22,11 @@ use miden_x402_types::{
     ASSET_TRANSFER_METHOD_P2ID, AccountIdHex, AssetTransferMethodTag, ExactScheme, MidenExactExtra,
     MidenExactPayload, MidenPaymentPayload, MidenPaymentRequired, MidenPaymentRequirements,
     MidenVerifyRequest, NoteIdHex, NoteKind, PAYMENT_REQUIRED_HEADER, PAYMENT_RESPONSE_HEADER,
-    PAYMENT_SIGNATURE_HEADER, PublicP2idPayload, ResourceInfo, SettleResponse, TransactionIdHex,
-    X402Version2, decode_payment_required_header, decode_payment_response_header,
-    decode_payment_signature_header, encode_payment_required_header,
-    encode_payment_response_header, encode_payment_signature_header, miden_testnet,
+    PAYMENT_SIGNATURE_HEADER, PrivateP2idPayload, PublicP2idPayload, ResourceInfo, SettleResponse,
+    TransactionIdHex, X402Version2, decode_payment_required_header,
+    decode_payment_response_header, decode_payment_signature_header,
+    encode_payment_required_header, encode_payment_response_header,
+    encode_payment_signature_header, miden_testnet,
 };
 
 const SAMPLE_FAUCET: &str = "0x0a7d175ed63ec5200fb2ced86f6aa5";
@@ -63,6 +64,9 @@ fn requirements() -> MidenPaymentRequirements {
             token_symbol: "USDC".to_owned(),
             decimals: 6,
             note_type: NoteKind::Public,
+            settlement: miden_x402_types::SettlementKind::Commit,
+            guardian_url: None,
+            serial_num: None,
         },
     }
 }
@@ -149,7 +153,9 @@ fn step_2_buyer_emits_payment_signature_header() {
             assert_eq!(p.block_num, 1_234_567);
             assert_eq!(p.amount, "1000");
         }
-        MidenExactPayload::Private(_) => panic!("expected public payload"),
+        MidenExactPayload::Private(_) | MidenExactPayload::GuardianFast(_) => {
+            panic!("expected public payload")
+        }
     }
 }
 
@@ -209,6 +215,102 @@ fn step_4_merchant_emits_payment_response_header() {
             assert_eq!(network, "miden:testnet");
         }
         SettleResponse::Error { .. } => panic!("expected Success"),
+    }
+}
+
+/// Same wire shape, private-note variant: the buyer carries the canonical
+/// `NoteFile` blob in `noteBlob` (base64) and the rest of the receipt fields
+/// mirror the public variant.
+#[test]
+fn private_payload_round_trips_through_signature_header() {
+    let mut req = requirements();
+    req.extra.note_type = NoteKind::Private;
+
+    let payload = MidenPaymentPayload {
+        accepted: req.clone(),
+        payload: MidenExactPayload::Private(PrivateP2idPayload {
+            note_blob: "Zm9v".to_owned(),
+            transaction_id: tx_id(),
+            sender: buyer(),
+            block_num: 1_234_567,
+            asset: faucet(),
+            amount: req.amount.clone(),
+        }),
+        resource: None,
+        x402_version: X402Version2,
+        extensions: None,
+    };
+
+    let header = encode_payment_signature_header(&payload).unwrap();
+    let decoded = decode_payment_signature_header(&header).unwrap();
+    match &decoded.payload {
+        MidenExactPayload::Private(p) => {
+            assert_eq!(p.note_blob, "Zm9v");
+            assert_eq!(p.transaction_id.as_str(), SAMPLE_TX_ID);
+            assert_eq!(p.sender.as_str(), SAMPLE_BUYER);
+            assert_eq!(p.block_num, 1_234_567);
+            assert_eq!(p.amount, "1000");
+        }
+        MidenExactPayload::Public(_) | MidenExactPayload::GuardianFast(_) => {
+            panic!("expected private payload")
+        }
+    }
+}
+
+/// Guardian-fast wire variant: the signed-but-unproven flow. Same scheme,
+/// same network — just a new payload variant and three optional `extra`
+/// fields telling the agent which endpoint to POST to and which serial_num
+/// to use.
+#[test]
+fn guardian_fast_payload_round_trips_through_signature_header() {
+    use miden_x402_types::{GuardianFastPayload, SettlementKind};
+
+    let mut req = requirements();
+    req.extra.note_type = NoteKind::Private;
+    req.extra.settlement = SettlementKind::GuardianFast;
+    req.extra.guardian_url = Some("https://facilitator.miden.io".to_owned());
+    let serial_num: miden_x402_types::NoteIdHex = format!("0x{}", "c".repeat(64)).parse().unwrap();
+    req.extra.serial_num = Some(serial_num.clone());
+
+    let payload = MidenPaymentPayload {
+        accepted: req.clone(),
+        payload: MidenExactPayload::GuardianFast(GuardianFastPayload {
+            tx_inputs: "dHhfaW5wdXRzX2Jsb2I=".to_owned(),
+            signature: "c2lnX2Jsb2I=".to_owned(),
+            signed_summary: "c3VtbWFyeV9ibG9i".to_owned(),
+            expected_note_blob: "Zm9v".to_owned(),
+            serial_num,
+            transaction_id: tx_id(),
+            sender: buyer(),
+            asset: faucet(),
+            amount: req.amount.clone(),
+        }),
+        resource: None,
+        x402_version: X402Version2,
+        extensions: None,
+    };
+
+    let header = encode_payment_signature_header(&payload).unwrap();
+    let decoded = decode_payment_signature_header(&header).unwrap();
+    assert_eq!(
+        decoded.accepted.extra.settlement,
+        SettlementKind::GuardianFast,
+    );
+    assert_eq!(
+        decoded.accepted.extra.guardian_url.as_deref(),
+        Some("https://facilitator.miden.io"),
+    );
+    match &decoded.payload {
+        MidenExactPayload::GuardianFast(p) => {
+            assert_eq!(p.tx_inputs, "dHhfaW5wdXRzX2Jsb2I=");
+            assert_eq!(p.expected_note_blob, "Zm9v");
+            assert_eq!(p.serial_num.as_str(), &format!("0x{}", "c".repeat(64)));
+            assert_eq!(p.sender.as_str(), SAMPLE_BUYER);
+            assert_eq!(p.amount, "1000");
+        }
+        MidenExactPayload::Public(_) | MidenExactPayload::Private(_) => {
+            panic!("expected guardianFast payload")
+        }
     }
 }
 
