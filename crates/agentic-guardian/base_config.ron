@@ -1,0 +1,36 @@
+// agentic-guardian default configuration.
+//
+// Override per field with MIDENX402_<SECTION>__<FIELD> environment vars,
+// e.g.:
+//
+//   MIDENX402_APP__LISTEN=0.0.0.0:8080
+//   MIDENX402_DB__DB_URL=postgres://...
+//   MIDENX402_MIDEN__NODE_URL=https://rpc.testnet.miden.io:443
+
+Config(
+    app: AppConfig(
+        listen: "0.0.0.0:8080",
+        network_id: "miden:testnet",
+        cors_allowed_origins: ["*"],
+    ),
+    db: DbConfig(
+        db_url: "postgres://agentic:agentic_password@localhost:5432/agentic_guardian",
+        max_conn: 10,
+    ),
+    miden: MidenConfig(
+        node_url: "https://rpc.testnet.miden.io:443",
+        remote_prover_url: "https://prover.testnet.miden.io:443",
+        store_path: "/var/agentic-guardian/store",
+        keystore_path: "/var/agentic-guardian/keystore",
+        timeout: "30s",
+    ),
+    batch: BatchConfig(
+        max_batch_size: 16,
+        max_batch_age: "750ms",
+        tick_interval: "100ms",
+    ),
+    mandate: MandateConfig(
+        challenge_ttl: "120s",
+        reservation_ttl: "60s",
+    ),
+)

@@ -124,6 +124,14 @@ pub enum SettlementKind {
     /// proves + submits the tx asynchronously. Only meaningful with
     /// `noteType: "private"`.
     GuardianFast,
+    /// Agentic flow per `ideas/NEW_DESIGN.md`. The buyer (agent) signs an
+    /// unproven tx with a **hot key** authorised by an AP2 mandate; the
+    /// agentic-guardian verifies the hot-key signature, enforces the
+    /// mandate (amount cap, merchant allowlist, time window, daily total),
+    /// tracks per-agent pending state (allowing multiple in-flight txs
+    /// chained on each other), batches verified txs, then proves +
+    /// submits via `SubmitProvenBatch`.
+    Agentic,
 }
 
 fn is_default_settlement(s: &SettlementKind) -> bool {
@@ -160,6 +168,21 @@ pub struct MidenExactExtra {
     /// challenge id by the facilitator's `ChallengeStore`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub serial_num: Option<NoteIdHex>,
+    /// Agentic-guardian endpoint URL — only meaningful with
+    /// `settlement: "agentic"`. Tells the agent which agentic-guardian
+    /// to POST the signed-unproven tx to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agentic_guardian_url: Option<String>,
+    /// Mandate identifier — only meaningful with `settlement: "agentic"`.
+    /// Lets the agentic-guardian look up the AP2 mandate that gates this
+    /// payment. The agent client populates this from `/agentic/register`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mandate_id: Option<String>,
+    /// Opaque tag the merchant attaches for routing incoming P2ID notes
+    /// on its side. Optional in M8 (merchants can demultiplex by `payTo`
+    /// alone); recommended with `settlement: "agentic"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note_tag: Option<String>,
 }
 
 /// The scheme-specific payload that travels in `PAYMENT-SIGNATURE`.
@@ -188,17 +211,24 @@ pub enum MidenExactPayload {
     /// Guardian-facilitator verifies the Falcon signature offline and
     /// proves + submits asynchronously.
     GuardianFast(GuardianFastPayload),
+    /// Payment by an agentic-guardian-facilitated signed-but-unproven
+    /// private P2ID transaction. Per `ideas/NEW_DESIGN.md`: the buyer is
+    /// an agent account with a **hot key** authorised by an AP2 mandate;
+    /// the agentic-guardian verifies the hot-key signature, enforces the
+    /// mandate, tracks per-agent pending state, then batches + submits.
+    Agentic(AgenticPayload),
 }
 
 impl MidenExactPayload {
-    /// Semantic note kind backing each variant. Both `Private` and
-    /// `GuardianFast` are semantically private notes; only the settlement
-    /// flow differs. Used by the facilitator's agreement step to confirm
-    /// `extra.noteType` matches the payload variant.
+    /// Semantic note kind backing each variant. `Private`, `GuardianFast`,
+    /// and `Agentic` are all semantically private notes; only the
+    /// settlement flow differs.
     pub fn semantic_note_type(&self) -> NoteKind {
         match self {
             MidenExactPayload::Public(_) => NoteKind::Public,
-            MidenExactPayload::Private(_) | MidenExactPayload::GuardianFast(_) => NoteKind::Private,
+            MidenExactPayload::Private(_)
+            | MidenExactPayload::GuardianFast(_)
+            | MidenExactPayload::Agentic(_) => NoteKind::Private,
         }
     }
 
@@ -207,6 +237,7 @@ impl MidenExactPayload {
         match self {
             MidenExactPayload::Public(_) | MidenExactPayload::Private(_) => SettlementKind::Commit,
             MidenExactPayload::GuardianFast(_) => SettlementKind::GuardianFast,
+            MidenExactPayload::Agentic(_) => SettlementKind::Agentic,
         }
     }
 }
@@ -316,6 +347,69 @@ pub struct GuardianFastPayload {
     /// `TransactionInputs`.
     pub transaction_id: TransactionIdHex,
     /// Account ID of the payer (the note's sender).
+    pub sender: AccountIdHex,
+    /// Faucet account ID of the fungible asset transferred.
+    pub asset: AccountIdHex,
+    /// Asset amount in atomic units, as a decimal string.
+    pub amount: String,
+}
+
+/// Agentic-flow payment payload (NEW_DESIGN.md §37-50).
+///
+/// Carries a signed-but-unproven Miden transaction where the signer is
+/// the agent's **hot key**. The agentic-guardian:
+///
+/// 1. Looks up the buyer's pending state; verifies `pending_state_commitment` matches.
+/// 2. Verifies `hot_signature` against `signed_summary.to_commitment()`
+///    using the agent's registered hot pubkey.
+/// 3. Decodes `expected_note_blob`, validates it's a P2ID to the merchant
+///    in the 402; recomputes the note id and binds it to
+///    `signed_summary.output_notes`.
+/// 4. Evaluates the AP2 mandate (amount cap, merchant allowlist, time
+///    window, daily total).
+/// 5. Computes input + output nullifiers; reserves them transactionally.
+/// 6. Advances pending state for the agent and acks.
+///
+/// Prove + submit happens later in the agentic-guardian's batch worker
+/// (parallel per-tx `RemoteTransactionProver::prove` then a single
+/// `SubmitProvenBatch` call).
+///
+/// Distinguishing fields vs [`GuardianFastPayload`]:
+///
+/// - `hot_signature` instead of generic `signature` — explicit naming so
+///   downstream code makes the role clear.
+/// - `pending_state_commitment` — the agent's local view of the
+///   account's pending state. The Guardian rejects if it doesn't match
+///   the Guardian's tracked pending state.
+/// - No `transaction_id` field — the only meaningful id is the post-prove
+///   `ProvenTransaction.id()`, which the agentic-guardian returns to the
+///   client via `/agentic/status/{queued_id}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgenticPayload {
+    /// Base64-encoded canonical `miden_protocol::transaction::TransactionInputs`.
+    pub tx_inputs: String,
+    /// Base64-encoded `miden_protocol::account::auth::Signature` produced
+    /// by the agent's **hot key** over `signed_summary.to_commitment()`.
+    pub hot_signature: String,
+    /// Base64-encoded `miden_protocol::transaction::TransactionSummary` —
+    /// the exact value whose `.to_commitment()` digest the buyer signed.
+    pub signed_summary: String,
+    /// Base64-encoded `miden_protocol::note::NoteFile::NoteDetails` for
+    /// the expected output P2ID note.
+    pub expected_note_blob: String,
+    /// Echo of `requirements.extra.serialNum`.
+    pub serial_num: NoteIdHex,
+    /// The agent client's view of the account's pending-state commitment
+    /// — the commitment of the state this tx is built against. The
+    /// agentic-guardian rejects if this does not match its tracked
+    /// pending state for this agent (prevents forks; see NEW_DESIGN
+    /// §39).
+    pub pending_state_commitment: NoteIdHex,
+    /// Echo of `requirements.extra.mandateId`. The agentic-guardian
+    /// looks up the AP2 mandate by this id and enforces it.
+    pub mandate_id: String,
+    /// Account ID of the payer (the agent's Miden account).
     pub sender: AccountIdHex,
     /// Faucet account ID of the fungible asset transferred.
     pub asset: AccountIdHex,
@@ -518,6 +612,9 @@ mod tests {
             settlement: SettlementKind::Commit,
             guardian_url: None,
             serial_num: None,
+            agentic_guardian_url: None,
+            mandate_id: None,
+            note_tag: None,
         };
         let json = serde_json::to_string(&extra).unwrap();
         let decoded: MidenExactExtra = serde_json::from_str(&json).unwrap();
@@ -530,6 +627,9 @@ mod tests {
         assert!(!json.contains("settlement"));
         assert!(!json.contains("guardianUrl"));
         assert!(!json.contains("serialNum"));
+        assert!(!json.contains("agenticGuardianUrl"));
+        assert!(!json.contains("mandateId"));
+        assert!(!json.contains("noteTag"));
     }
 
     #[test]
@@ -542,6 +642,9 @@ mod tests {
             settlement: SettlementKind::GuardianFast,
             guardian_url: Some("https://facilitator.miden.io".to_owned()),
             serial_num: Some(sample_word('c').parse().unwrap()),
+            agentic_guardian_url: None,
+            mandate_id: None,
+            note_tag: None,
         };
         let json = serde_json::to_string(&extra).unwrap();
         let decoded: MidenExactExtra = serde_json::from_str(&json).unwrap();

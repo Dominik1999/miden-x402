@@ -20,6 +20,7 @@
 pub mod aliases;
 pub mod header;
 pub mod ids;
+pub mod mandate;
 pub mod network;
 pub mod scheme;
 
@@ -34,13 +35,14 @@ pub use header::{
     encode_payment_response_header, encode_payment_signature_header,
 };
 pub use ids::{AccountIdHex, IdError, NoteIdHex, TransactionIdHex};
+pub use mandate::{Ap2Mandate, Ap2SignedMandate, MandateSchemaError};
 pub use network::{
     MAINNET_REFERENCE, MIDEN_NAMESPACE, TESTNET_REFERENCE, miden_mainnet, miden_testnet,
 };
 pub use scheme::{
-    ASSET_TRANSFER_METHOD_P2ID, AssetTransferMethodTag, ExactScheme, GuardianFastPayload,
-    MidenExactExtra, MidenExactPayload, NoteKind, PrivateP2idPayload, PublicP2idPayload,
-    SettlementKind,
+    ASSET_TRANSFER_METHOD_P2ID, AgenticPayload, AssetTransferMethodTag, ExactScheme,
+    GuardianFastPayload, MidenExactExtra, MidenExactPayload, NoteKind, PrivateP2idPayload,
+    PublicP2idPayload, SettlementKind,
 };
 
 // Re-export the upstream x402 v2 types we share with the rest of the

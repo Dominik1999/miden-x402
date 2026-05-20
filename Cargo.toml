@@ -3,6 +3,8 @@ resolver = "2"
 members = [
     "crates/miden-x402-types",
     "crates/miden-x402-facilitator",
+    "crates/agentic-guardian",
+    "crates/miden-agentic-client",
 ]
 
 [workspace.package]

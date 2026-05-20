@@ -67,6 +67,9 @@ fn requirements() -> MidenPaymentRequirements {
             settlement: miden_x402_types::SettlementKind::Commit,
             guardian_url: None,
             serial_num: None,
+            agentic_guardian_url: None,
+            mandate_id: None,
+            note_tag: None,
         },
     }
 }
@@ -153,9 +156,9 @@ fn step_2_buyer_emits_payment_signature_header() {
             assert_eq!(p.block_num, 1_234_567);
             assert_eq!(p.amount, "1000");
         }
-        MidenExactPayload::Private(_) | MidenExactPayload::GuardianFast(_) => {
-            panic!("expected public payload")
-        }
+        MidenExactPayload::Private(_)
+        | MidenExactPayload::GuardianFast(_)
+        | MidenExactPayload::Agentic(_) => panic!("expected public payload"),
     }
 }
 
@@ -251,9 +254,9 @@ fn private_payload_round_trips_through_signature_header() {
             assert_eq!(p.block_num, 1_234_567);
             assert_eq!(p.amount, "1000");
         }
-        MidenExactPayload::Public(_) | MidenExactPayload::GuardianFast(_) => {
-            panic!("expected private payload")
-        }
+        MidenExactPayload::Public(_)
+        | MidenExactPayload::GuardianFast(_)
+        | MidenExactPayload::Agentic(_) => panic!("expected private payload"),
     }
 }
 
@@ -308,9 +311,72 @@ fn guardian_fast_payload_round_trips_through_signature_header() {
             assert_eq!(p.sender.as_str(), SAMPLE_BUYER);
             assert_eq!(p.amount, "1000");
         }
-        MidenExactPayload::Public(_) | MidenExactPayload::Private(_) => {
-            panic!("expected guardianFast payload")
+        MidenExactPayload::Public(_)
+        | MidenExactPayload::Private(_)
+        | MidenExactPayload::Agentic(_) => panic!("expected guardianFast payload"),
+    }
+}
+
+/// Agentic wire variant: hot-signed unproven tx + pending state commitment +
+/// mandate id. New variant added on `feat/agentic-guardian` branch per
+/// `ideas/NEW_DESIGN.md`. Existing `public` / `private` / `guardianFast`
+/// variants are untouched.
+#[test]
+fn agentic_payload_round_trips_through_signature_header() {
+    use miden_x402_types::{AgenticPayload, SettlementKind};
+
+    let mut req = requirements();
+    req.extra.note_type = NoteKind::Private;
+    req.extra.settlement = SettlementKind::Agentic;
+    req.extra.agentic_guardian_url = Some("https://agentic-guardian.example".to_owned());
+    req.extra.mandate_id = Some("m-abc".to_owned());
+    req.extra.note_tag = Some("weather.api".to_owned());
+    let serial_num: miden_x402_types::NoteIdHex = format!("0x{}", "c".repeat(64)).parse().unwrap();
+    req.extra.serial_num = Some(serial_num.clone());
+    let pending_state: miden_x402_types::NoteIdHex =
+        format!("0x{}", "d".repeat(64)).parse().unwrap();
+
+    let payload = MidenPaymentPayload {
+        accepted: req.clone(),
+        payload: MidenExactPayload::Agentic(AgenticPayload {
+            tx_inputs: "dHhfaW5wdXRz".to_owned(),
+            hot_signature: "aG90X3NpZw==".to_owned(),
+            signed_summary: "c3VtbWFyeQ==".to_owned(),
+            expected_note_blob: "Zm9v".to_owned(),
+            serial_num,
+            pending_state_commitment: pending_state.clone(),
+            mandate_id: "m-abc".to_owned(),
+            sender: buyer(),
+            asset: faucet(),
+            amount: req.amount.clone(),
+        }),
+        resource: None,
+        x402_version: X402Version2,
+        extensions: None,
+    };
+
+    let header = encode_payment_signature_header(&payload).unwrap();
+    let decoded = decode_payment_signature_header(&header).unwrap();
+    assert_eq!(decoded.accepted.extra.settlement, SettlementKind::Agentic);
+    assert_eq!(
+        decoded.accepted.extra.agentic_guardian_url.as_deref(),
+        Some("https://agentic-guardian.example"),
+    );
+    assert_eq!(decoded.accepted.extra.mandate_id.as_deref(), Some("m-abc"));
+    assert_eq!(decoded.accepted.extra.note_tag.as_deref(), Some("weather.api"));
+    match &decoded.payload {
+        MidenExactPayload::Agentic(p) => {
+            assert_eq!(p.tx_inputs, "dHhfaW5wdXRz");
+            assert_eq!(p.hot_signature, "aG90X3NpZw==");
+            assert_eq!(p.expected_note_blob, "Zm9v");
+            assert_eq!(p.mandate_id, "m-abc");
+            assert_eq!(p.pending_state_commitment.as_str(), pending_state.as_str());
+            assert_eq!(p.sender.as_str(), SAMPLE_BUYER);
+            assert_eq!(p.amount, "1000");
         }
+        MidenExactPayload::Public(_)
+        | MidenExactPayload::Private(_)
+        | MidenExactPayload::GuardianFast(_) => panic!("expected agentic payload"),
     }
 }
 

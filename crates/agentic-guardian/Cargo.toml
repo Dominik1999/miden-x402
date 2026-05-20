@@ -1,0 +1,64 @@
+[package]
+name        = "agentic-guardian"
+version     = "0.1.0"
+description = "Agentic-guardian server for x402 on Miden — high-throughput verify-before-prove with AP2-mandate gating and per-agent pending state. Implements `ideas/NEW_DESIGN.md`."
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "agentic_guardian"
+path = "src/lib.rs"
+
+[[bin]]
+name = "agentic-guardian"
+path = "src/bin/agentic_guardian.rs"
+
+[dependencies]
+# Wire types
+miden-x402-types = { workspace = true }
+x402-types       = { workspace = true }
+
+# Shared primitives
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+thiserror          = { workspace = true }
+async-trait        = { workspace = true }
+base64             = { workspace = true }
+anyhow             = "1"
+hex                = "0.4"
+blake3             = "1"
+
+# Miden
+miden-client    = { workspace = true }
+miden-standards = { workspace = true }
+miden-protocol  = "0.14"
+miden-crypto    = "0.23"
+miden-remote-prover-client = "0.14"
+
+# Storage — Diesel + Postgres (matches inicio-labs `coordinator/store`)
+diesel       = { version = "2", default-features = false, features = ["chrono", "uuid"] }
+diesel-async = { version = "0.7", features = ["deadpool", "postgres"] }
+chrono       = { version = "0.4", features = ["serde"] }
+uuid         = { version = "1", features = ["v4", "serde"] }
+
+# HTTP / runtime
+axum               = { workspace = true }
+tokio              = { workspace = true }
+tower              = { workspace = true }
+tower-http         = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+reqwest            = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Config: RON file with env overrides (matches inicio-labs pattern)
+config        = { version = "0.15", default-features = false, features = ["ron"] }
+url           = { version = "2", features = ["serde"] }
+humantime-serde = "1.1"
+
+rand = "0.9"
+
+[dev-dependencies]
+tempfile = "3"
+tower    = { workspace = true, features = ["util"] }

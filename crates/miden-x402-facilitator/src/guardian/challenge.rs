@@ -172,6 +172,9 @@ mod tests {
                 settlement: SettlementKind::GuardianFast,
                 guardian_url: Some("https://facilitator.miden.io".to_owned()),
                 serial_num: None,
+                agentic_guardian_url: None,
+                mandate_id: None,
+                note_tag: None,
             },
         }
     }

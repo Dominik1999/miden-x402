@@ -482,5 +482,86 @@ is `400` for client-side failures and `500` for unexpected node failures.
 | Quickstart README + scheme + deploy docs | M6 — shipped |
 | Private notes (`noteType: "private"`) | M7 — shipped |
 | Guardian verify-before-prove (`settlement: "guardian-fast"`) | M8 — shipped (verify path; settle path requires WASM SDK extensions to drive the buyer side end-to-end) |
+| Agentic flow (`settlement: "agentic"`) — separate `agentic-guardian` binary per [`ideas/NEW_DESIGN.md`](../ideas/NEW_DESIGN.md) | feat/agentic-guardian branch — see [§A.2.8](#a28-agentic-variant-newdesignmd) and [`docs/agentic-guardian-deployment.md`](agentic-guardian-deployment.md) |
 
 [`ErrorReason`]: https://docs.rs/x402-types/latest/x402_types/proto/enum.ErrorReason.html
+
+---
+
+## A.2.8 Agentic variant (NEW_DESIGN.md)
+
+The `feat/agentic-guardian` branch adds a fourth payload variant on top
+of M8's `public` / `private` / `guardianFast`. Wire-level it is
+additive: the existing variants are byte-for-byte unchanged.
+
+When `accepts[*].extra.settlement == "agentic"`, the buyer is an
+**agent account** with a hot key (for in-mandate payments) + cold key
+(for out-of-mandate ops). The agent signs an unproven tx with the hot
+key and posts it to a separate `agentic-guardian` binary (NOT the M8
+`miden-x402-facilitator`), which:
+
+1. Verifies the hot-key Falcon signature.
+2. Looks up + enforces the **AP2 mandate** the user signed at setup
+   (amount cap, merchant allowlist, time window, daily total — see
+   [`docs/ap2-mandate.md`](ap2-mandate.md)).
+3. CAS-advances the **per-agent pending state** (allowing the agent
+   to submit multiple in-flight txs that chain on each other, since
+   the Guardian is the single serialization authority).
+4. Reserves nullifiers (Postgres-WAL-backed).
+5. Acks the client (sub-second perceived latency).
+6. Asynchronously: parallel-proves N queued txs and submits as a
+   `TransactionBatch` via `SubmitProvenBatch`.
+
+402 `extra` shape for `agentic`:
+
+```json
+{
+  "assetTransferMethod": "miden-p2id",
+  "tokenSymbol": "USDC",
+  "decimals": 6,
+  "noteType": "private",
+  "settlement": "agentic",
+  "agenticGuardianUrl": "https://agentic-guardian.example",
+  "mandateId": "m-abc",
+  "noteTag": "weather.api",
+  "serialNum": "0x<32-byte server-generated word>"
+}
+```
+
+`Payment-Signature` payload variant for `agentic`:
+
+```json
+{
+  "noteType": "agentic",
+  "txInputs":               "<base64(TransactionInputs)>",
+  "hotSignature":           "<base64(Falcon Signature)>",
+  "signedSummary":          "<base64(TransactionSummary)>",
+  "expectedNoteBlob":       "<base64(NoteFile::NoteDetails)>",
+  "serialNum":              "0x...",
+  "pendingStateCommitment": "0x...",
+  "mandateId":              "m-abc",
+  "sender":                 "0x...",
+  "asset":                  "0x...",
+  "amount":                 "1000"
+}
+```
+
+Distinguishing fields vs the M8 `guardianFast` variant:
+
+- `hotSignature` (explicit naming for the role).
+- `pendingStateCommitment` — the agent's local view of the account's
+  pending state; the agentic-guardian rejects if it doesn't match.
+- `mandateId` — looks up the AP2 mandate to gate the tx.
+- No `transactionId` — the only meaningful id is the post-prove
+  `ProvenTransaction.id()`, returned later via
+  `GET /agentic/status/{queued_id}`.
+
+The agentic-guardian's HTTP API (see
+[`docs/agentic-guardian-deployment.md`](agentic-guardian-deployment.md)):
+
+- `POST /agentic/register` — one-time agent + mandate registration.
+- `POST /agentic/submit` — hot-path 8-step verify + enqueue.
+- `GET /agentic/status/{queued_id}` — current state of a queued tx.
+- `GET /agentic/pending_state/{agent_id}` — current pending state.
+- `POST /x402/challenge`, `POST /x402/verify`, `POST /x402/settle` —
+  merchant-facing wrappers.

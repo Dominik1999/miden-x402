@@ -227,6 +227,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             settlement: miden_x402_types::SettlementKind::Commit,
             guardian_url: None,
             serial_num: None,
+            agentic_guardian_url: None,
+            mandate_id: None,
+            note_tag: None,
         },
     };
 

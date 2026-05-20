@@ -171,6 +171,16 @@ fn step_1_3_agreement(
             // — the commit-flow agreement is not its concern.
             unreachable!("guardian-fast payload reached commit-flow agreement step")
         }
+        MidenExactPayload::Agentic(_) => {
+            // Agentic settlement is handled by the separate
+            // `agentic-guardian` binary on this branch — the M8
+            // facilitator never sees it. If we got here, the caller
+            // sent the wrong variant.
+            return Err(FacilitatorError::BadRequest(
+                "agentic payloads are handled by agentic-guardian, not the M8 facilitator"
+                    .to_owned(),
+            ));
+        }
     };
     if echo_asset != &requirements.asset {
         return Err(FacilitatorError::BadRequest(
@@ -198,6 +208,9 @@ async fn resolve_note<N: MidenNode + ?Sized>(
         MidenExactPayload::GuardianFast(_) => {
             unreachable!("guardian-fast payload reached commit-flow resolve_note")
         }
+        MidenExactPayload::Agentic(_) => Err(FacilitatorError::BadRequest(
+            "agentic payloads belong to agentic-guardian, not the M8 facilitator".to_owned(),
+        )),
     }
 }
 
@@ -448,6 +461,9 @@ mod tests {
                 settlement: miden_x402_types::SettlementKind::Commit,
                 guardian_url: None,
                 serial_num: None,
+                agentic_guardian_url: None,
+                mandate_id: None,
+                note_tag: None,
             },
         }
     }

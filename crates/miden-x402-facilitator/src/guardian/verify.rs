@@ -321,6 +321,9 @@ mod tests {
                 settlement: SettlementKind::GuardianFast,
                 guardian_url: Some("http://localhost:8080".to_owned()),
                 serial_num: None,
+                agentic_guardian_url: None,
+                mandate_id: None,
+                note_tag: None,
             },
         }
     }
