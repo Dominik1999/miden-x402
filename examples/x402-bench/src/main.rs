@@ -62,6 +62,12 @@ struct Args {
     /// Miden node RPC endpoint. Only used in real-Miden mode.
     #[arg(long, default_value = "https://rpc.testnet.miden.io")]
     miden_rpc: String,
+
+    /// Simulate per-leg network latency (one-way, milliseconds) by
+    /// sleeping before each merchant + facilitator HTTP call. Use 50
+    /// for "100ms RTT" between agent and any other component.
+    #[arg(long, default_value_t = 0u64)]
+    simulated_oneway_ms: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -233,6 +239,22 @@ async fn main() -> anyhow::Result<()> {
         }
         None => None,
     };
+
+    // Stash the simulated-latency knob in an env var so the inner
+    // payment loop (which lives in a separate function) can pick it
+    // up without threading a new parameter through every call site.
+    if args.simulated_oneway_ms > 0 {
+        unsafe {
+            std::env::set_var(
+                "BENCH_SIM_ONEWAY_MS",
+                args.simulated_oneway_ms.to_string(),
+            );
+        }
+        tracing::info!(
+            oneway_ms = args.simulated_oneway_ms,
+            "simulated per-leg latency enabled"
+        );
+    }
 
     let cfg = Arc::new(cfg);
     let setup_report = setup_report.map(|(d, r)| Arc::new((d, r)));
@@ -425,9 +447,21 @@ async fn run_one_payment(
     http: &reqwest::Client,
     resource_url: &str,
 ) -> anyhow::Result<PaymentRow> {
+    let sim_oneway_ms: u64 = std::env::var("BENCH_SIM_ONEWAY_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let sim = || async {
+        if sim_oneway_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(sim_oneway_ms)).await;
+        }
+    };
+
     // Step 1: GET /resource → 402 with PAYMENT-REQUIRED.
     let t_resource_get1_sent = now_unix_micros();
+    sim().await;
     let res = http.get(resource_url).send().await?;
+    sim().await;
     let t_402_received = now_unix_micros();
     if res.status() != reqwest::StatusCode::PAYMENT_REQUIRED {
         anyhow::bail!("expected 402, got {}", res.status());
@@ -451,7 +485,16 @@ async fn run_one_payment(
     };
 
     // Step 2: client.pay() — instrumented.
-    let (receipt, timings) = client.pay_with_metrics(ctx).await?;
+    sim().await;
+    let (receipt, mut timings) = client.pay_with_metrics(ctx).await?;
+    sim().await;
+    // Adjust the client-side timestamps so that the wrapped network
+    // delay shows up in `d_facilitator_us` (the metric the design
+    // author is comparing against Base's ~400ms).
+    if sim_oneway_ms > 0 {
+        let delay = sim_oneway_ms * 1000;
+        timings.t_ack_received = timings.t_ack_received.saturating_add(delay);
+    }
     let nullifier = receipt.reserved_nullifiers.first().cloned().unwrap_or_default();
 
     // Step 3: GET /resource again with PAYMENT-SIGNATURE header.
@@ -462,11 +505,13 @@ async fn run_one_payment(
     let sig_b64 = base64::engine::general_purpose::STANDARD
         .encode(serde_json::to_vec(&sig)?);
     let t_resource_get2_sent = now_unix_micros();
+    sim().await;
     let res2 = http
         .get(resource_url)
         .header(HDR_PAYMENT_SIGNATURE, sig_b64)
         .send()
         .await?;
+    sim().await;
     let t_resource_delivered = now_unix_micros();
     if !res2.status().is_success() {
         anyhow::bail!(
