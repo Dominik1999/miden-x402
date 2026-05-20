@@ -1,104 +1,67 @@
 /**
- * Abstract `Payer` interface: anything that can build, prove, and submit a
- * P2ID note on Miden testnet (public or private), and wait for it to land
- * in a committed block.
+ * Agent-side `Payer` interface for the Guardian-facilitator wire.
  *
- * The reference implementation in `wasm-sdk-payer.ts` adapts
- * `@miden-sdk/miden-sdk` (WASM). Tests mock this directly.
+ * Builds a signed-but-unproven Miden transaction whose output P2ID note
+ * matches the merchant's `MidenPaymentRequirements`, packages it into a
+ * `MidenP2idPrivatePayload`, and (in the full E2E flow) submits it to the
+ * Guardian-facilitator's `/x402/settle` endpoint.
+ *
+ * The reference implementation is intentionally a stub — building a signed
+ * unproven `TransactionInputs` from JS requires WASM SDK extensions in
+ * `@miden-sdk/miden-sdk` that don't exist yet (the SDK can prove + submit,
+ * but the "build + sign + STOP before proving" seam isn't exposed). Rust
+ * agents work end-to-end today via the `miden-multisig-client` crate in the
+ * OZ Guardian repo; Node + browser agents need this upstream work.
+ *
+ * Tracked in `docs/UPSTREAM_WISHLIST.md`.
  */
 
-import type { HexId, NoteKind } from '@miden-x402/types';
+import type { HexId, MidenP2idPrivatePayload } from '@miden-x402/types';
 
-export interface P2idPaymentRequest {
-  /** Recipient (merchant) account id. */
+export interface UnprovenTxRequest {
+  /** Buyer (Miden) account id. */
+  buyerAccountId: HexId;
+  /** Merchant account id (`requirements.payTo`). */
   payTo: HexId;
-  /** Faucet account id of the asset to send. */
+  /** Faucet account id (`requirements.asset`). */
   asset: HexId;
   /** Atomic-unit amount as decimal string. */
   amount: string;
-  /**
-   * Whether to build a public or private P2ID note. Defaults to `'public'`
-   * for backward compatibility with pre-M7 Payer impls. The merchant chooses
-   * which note kind to request via `PaymentRequirements.extra.noteType`; the
-   * agent forwards that selection here.
-   */
-  noteType?: NoteKind;
-}
-
-export interface P2idPaymentReceipt {
-  /** Committed note id (32 bytes / 64 hex chars). */
-  noteId: HexId;
-  /** Create-note transaction id. */
-  transactionId: HexId;
-  /** Sender account id (echoed back, normalised). */
-  sender: HexId;
-  /** Block number in which the note was committed. */
-  blockNum: number;
-  /**
-   * For `noteType: 'private'`, the canonical Miden `NoteFile` serialised and
-   * base64-encoded. Omitted for the public path (only the commitment is
-   * needed there, and it's already in `noteId`). The agent forwards this
-   * into `PrivateP2idPayload.noteBlob`.
-   */
-  noteBlob?: string;
-}
-
-export interface Payer {
-  /**
-   * Builds + proves + submits a P2ID note, then waits for it to be included
-   * in a committed block on Miden testnet. Resolves with the receipt fields
-   * the merchant's `Payment-Signature` payload needs.
-   */
-  payP2ID(request: P2idPaymentRequest): Promise<P2idPaymentReceipt>;
-
-  /**
-   * Builds + signs (without proving or submitting) a private P2ID
-   * transaction. Returns the canonical serialized inputs the Guardian needs
-   * to verify offline and later prove + submit. Optional — only implement
-   * if the underlying client/WASM SDK exposes an execute-without-prove
-   * path.
-   *
-   * `serialNum` is server-generated and must be honoured exactly so the
-   * Guardian's pre-computed nullifier matches.
-   */
-  payP2IDUnproven?(request: P2idUnprovenRequest): Promise<P2idUnprovenReceipt>;
-}
-
-export interface P2idUnprovenRequest {
-  /** Recipient (merchant) account id. */
-  payTo: HexId;
-  /** Faucet account id of the asset to send. */
-  asset: HexId;
-  /** Atomic-unit amount as decimal string. */
-  amount: string;
-  /**
-   * Server-issued 32-byte hex `serial_num`. The agent must use this exact
-   * value as the P2ID note's serial number; the Guardian pre-computed the
-   * resulting nullifier at 402-time and will reject any deviation.
-   */
+  /** Server-issued `serial_num` (`requirements.extra.serialNum`). */
   serialNum: HexId;
+  /** Note tag (`requirements.extra.noteTag`). */
+  noteTag: string;
 }
 
-export interface P2idUnprovenReceipt {
-  /** Base64-encoded canonical `TransactionInputs` blob. */
-  txInputs: string;
-  /**
-   * Base64-encoded `miden_protocol::account::auth::Signature` over the
-   * `TransactionSummary::to_commitment()` digest. The Guardian uses this
-   * for offline verification.
-   */
-  signature: string;
-  /**
-   * Base64-encoded `TransactionSummary` — the exact value whose
-   * commitment the buyer signed.
-   */
-  signedSummary: string;
-  /**
-   * Base64-encoded `NoteFile::NoteDetails` for the new output P2ID note.
-   */
-  expectedNoteBlob: string;
-  /** Pre-prove `TransactionId` derived from `TransactionInputs`. */
-  transactionId: HexId;
-  /** Sender account id. */
-  sender: HexId;
+/**
+ * A `Payer` builds and signs an unproven Miden transaction matching the
+ * merchant's requirements. The Guardian-facilitator does the actual prove
+ * + submit; the agent's only on-chain work is signing.
+ */
+export interface Payer {
+  buildUnprovenPayment(req: UnprovenTxRequest): Promise<MidenP2idPrivatePayload>;
+}
+
+/** Thrown when no concrete `Payer` implementation is wired up. */
+export class PayerNotImplemented extends Error {
+  constructor(reason: string) {
+    super(`agent payer not yet implemented: ${reason}`);
+    this.name = 'PayerNotImplemented';
+  }
+}
+
+/**
+ * Reference `Payer` stub. Throws on use until WASM SDK extensions ship.
+ * Provided so callers can wire the agent flow end-to-end and surface a
+ * useful error instead of `undefined`.
+ */
+export class StubPayer implements Payer {
+  async buildUnprovenPayment(_: UnprovenTxRequest): Promise<MidenP2idPrivatePayload> {
+    throw new PayerNotImplemented(
+      'building a signed unproven TransactionInputs from JS requires ' +
+        '`@miden-sdk/miden-sdk` extensions that are tracked upstream — see ' +
+        'docs/UPSTREAM_WISHLIST.md. Use the `miden-multisig-client` Rust crate ' +
+        'from the OZ Guardian repo for E2E agents today.',
+    );
+  }
 }

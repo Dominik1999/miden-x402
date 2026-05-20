@@ -51,7 +51,11 @@ export function paywall(opts: ExpressPaywallOptions): RequestHandler {
         description: opts.description ?? req.originalUrl,
         mimeType: opts.mimeType,
       },
-      config: { facilitatorUrl: opts.facilitatorUrl, fetch: opts.fetch },
+      config: {
+        facilitatorUrl: opts.facilitatorUrl,
+        fetch: opts.fetch,
+        merchantAuth: opts.merchantAuth,
+      },
     });
 
     if (outcome.kind === 'paid') {

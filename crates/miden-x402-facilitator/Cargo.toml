@@ -1,7 +1,7 @@
 [package]
 name        = "miden-x402-facilitator"
 version     = "0.1.0"
-description = "x402 v2 facilitator service for the Miden network"
+description = "Guardian-as-x402-facilitator: x402 v2 module bolted onto an OZ Guardian server"
 edition.workspace      = true
 rust-version.workspace = true
 license.workspace      = true
@@ -12,28 +12,8 @@ name = "miden_x402_facilitator"
 path = "src/lib.rs"
 
 [[bin]]
-name = "miden-x402-facilitator"
-path = "src/bin/miden_x402_facilitator.rs"
-
-[[bin]]
-name = "miden-x402-smoke-testnet"
-path = "src/bin/smoke_testnet.rs"
-
-[[bin]]
-name = "miden-x402-create-accounts"
-path = "src/bin/create_accounts.rs"
-
-[[bin]]
-name = "miden-x402-check-buyer"
-path = "src/bin/check_buyer.rs"
-
-[[bin]]
-name = "miden-x402-pay-and-verify"
-path = "src/bin/pay_and_verify.rs"
-
-[[bin]]
-name = "miden-x402-claim-payment"
-path = "src/bin/claim_payment.rs"
+name = "guardian-facilitator"
+path = "src/bin/guardian_facilitator.rs"
 
 [dependencies]
 miden-x402-types   = { workspace = true }
@@ -44,14 +24,22 @@ serde_json         = { workspace = true }
 thiserror          = { workspace = true }
 async-trait        = { workspace = true }
 base64             = { workspace = true }
+hex                = { workspace = true }
+blake3             = { workspace = true }
+rand               = { workspace = true }
 
+# Miden — pinned to OZ Guardian's workspace versions
+miden-protocol     = { workspace = true }
 miden-client       = { workspace = true }
-miden-client-sqlite-store = "0.14"
-miden-protocol     = "0.14"
 miden-standards    = { workspace = true }
-miden-remote-prover-client = "0.14"
-miden-crypto       = "0.23"
-rand               = "0.9"
+miden-tx           = { workspace = true }
+miden-remote-prover-client = { workspace = true }
+miden-crypto       = { workspace = true }
+
+# OpenZeppelin Guardian — the facilitator is a module bolted onto Guardian
+guardian-server       = { workspace = true }
+guardian-shared       = { workspace = true }
+miden-rpc-client      = { workspace = true }
 
 axum               = { workspace = true }
 tokio              = { workspace = true }
@@ -59,6 +47,9 @@ tower              = { workspace = true }
 tower-http         = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
+anyhow             = "1"
 
 [dev-dependencies]
-tower = { workspace = true, features = ["util"] }
+tower    = { workspace = true, features = ["util"] }
+tempfile = "3"
+tokio    = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

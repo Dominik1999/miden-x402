@@ -1,33 +1,32 @@
 /**
- * Framework-agnostic merchant logic.
+ * Framework-agnostic merchant logic for the Guardian-facilitator wire.
  *
- * The merchant never verifies the payment itself; it just forwards the
- * decoded payload + the matched requirements to the configured facilitator
- * and acts on the response. See `docs/protocol.md` §A.2 for the wire
- * exchange this implements.
+ * The merchant never verifies the payment itself; it forwards the decoded
+ * payload + the matched requirements to the configured Guardian-facilitator
+ * and acts on the response. See `docs/protocol.md` of the parent repo for
+ * the wire exchange.
  */
 
 import {
   PAYMENT_REQUIRED_HEADER,
   PAYMENT_SIGNATURE_HEADER,
   PAYMENT_RESPONSE_HEADER,
-  EXACT_SCHEME,
-  ASSET_TRANSFER_METHOD_P2ID,
+  MIDEN_P2ID_PRIVATE_SCHEME,
   MIDEN_TESTNET,
   decodePaymentSignatureHeader,
   encodePaymentRequiredHeader,
   encodePaymentResponseHeader,
+  type ChallengeResponse,
+  type DecimalAmount,
+  type HexId,
+  type MidenNetwork,
+  type MidenPaymentPayload,
   type MidenPaymentRequired,
   type MidenPaymentRequirements,
-  type MidenPaymentPayload,
   type ResourceInfo,
   type SettleResponse,
+  type SettleSuccess,
   type VerifyResponse,
-  type HexId,
-  type DecimalAmount,
-  type MidenNetwork,
-  type NoteKind,
-  type SettlementKind,
 } from '@miden-x402/types';
 
 export {
@@ -38,8 +37,7 @@ export {
 
 /**
  * What the merchant wants paid for the gated resource. One `PriceTag` maps
- * to one entry in the 402's `accepts[]` array. Future versions may support
- * multiple accepts (e.g. testnet + mainnet); for now we ship a single entry.
+ * to one entry in the 402's `accepts[]` array.
  */
 export interface PriceTag {
   /** Atomic-unit amount (e.g. `"1000"` = 1000 micro-USDC). */
@@ -50,97 +48,102 @@ export interface PriceTag {
   payTo: HexId;
   /** Network identifier. Defaults to `miden:testnet`. */
   network?: MidenNetwork;
-  /** Display token symbol for the buyer's UX (informational). */
-  tokenSymbol: string;
-  /** Token decimals (informational). */
-  decimals: number;
-  /** Note privacy. */
-  noteType?: NoteKind;
-  /**
-   * Settlement model. Defaults to `'commit'` (Phase A, settled-at-commit).
-   * Set to `'guardian-fast'` to opt into the verify-before-prove flow —
-   * requires `config.facilitatorUrl` to point at a Guardian-enabled
-   * facilitator (with `MIDEN_X402_GUARDIAN_ENABLED=true`), and Phase B
-   * mandates `noteType: 'private'`.
-   */
-  settlement?: SettlementKind;
-  /** Seconds the merchant is willing to wait for the note to commit. */
+  /** Note-tag the merchant attaches for routing incoming notes. */
+  noteTag: string;
+  /** Seconds the merchant is willing to wait for settlement. */
   maxTimeoutSeconds?: number;
 }
 
 export interface PaywallConfig {
-  /** Base URL of the Miden x402 facilitator. */
+  /** Base URL of the Guardian-facilitator. */
   facilitatorUrl: string;
+  /**
+   * Optional Guardian-style auth credentials for the merchant. Required by
+   * `POST /x402/challenge`, which is a Guardian-authenticated endpoint. If
+   * absent the merchant SDK skips the challenge step and emits a 402
+   * without a `serialNum` — the buyer's SDK must then call `/x402/challenge`
+   * itself (acceptable but less efficient).
+   */
+  merchantAuth?: MerchantAuth;
   /** Optional fetch implementation override (for testing). */
   fetch?: typeof fetch;
 }
 
+/**
+ * Guardian-style auth credentials for the merchant account. Producing valid
+ * signatures requires Falcon-512 over `RPO256([account_id, ts, payload])` —
+ * see Guardian's `spec/api.md` § Miden Request Signing. The SDK takes a
+ * pluggable signer rather than embedding the crypto so merchants can choose
+ * their own key-management story.
+ */
+export interface MerchantAuth {
+  /** The merchant's Miden account id (canonical hex). */
+  accountId: HexId;
+  /**
+   * Returns the `x-pubkey`, `x-signature`, `x-timestamp` headers for a
+   * given request body. The signer is responsible for computing the
+   * payload digest and signing it.
+   */
+  signRequest(body: string): Promise<{
+    'x-pubkey': string;
+    'x-signature': string;
+    'x-timestamp': string;
+  }>;
+}
+
 export interface VerifyResult {
   ok: boolean;
-  /** When `ok`, the underlying facilitator response on success. */
-  settle?: Extract<SettleResponse, { success: true }>;
-  /** When `!ok`, the merchant-facing error string for the next 402 body. */
+  settle?: SettleSuccess;
   error?: string;
 }
 
 /**
- * Builds the requirements without acquiring a Guardian challenge. The
- * `serialNum`/`guardianUrl` fields are left absent — the caller (typically
- * `processPayment`) is expected to populate them via
- * {@link acquireGuardianChallenge} when `settlement: 'guardian-fast'`.
+ * Builds the requirements without acquiring a `serial_num`. The caller is
+ * expected to call {@link acquireChallenge} to populate `extra.serialNum`
+ * before emitting the 402.
  */
 export function buildRequirements(price: PriceTag): MidenPaymentRequirements {
   return {
-    scheme: EXACT_SCHEME,
+    scheme: MIDEN_P2ID_PRIVATE_SCHEME,
     network: price.network ?? MIDEN_TESTNET,
     amount: price.amount,
     asset: price.asset,
     payTo: price.payTo,
     maxTimeoutSeconds: price.maxTimeoutSeconds ?? 120,
-    extra: {
-      assetTransferMethod: ASSET_TRANSFER_METHOD_P2ID,
-      tokenSymbol: price.tokenSymbol,
-      decimals: price.decimals,
-      noteType: price.noteType ?? 'public',
-      ...(price.settlement && price.settlement !== 'commit'
-        ? { settlement: price.settlement }
-        : {}),
-    },
+    extra: { noteTag: price.noteTag },
   };
 }
 
 /**
- * For `settlement: 'guardian-fast'`, asks the facilitator to issue a
- * server-generated `serial_num` for this payment offer. Returns the
- * requirements with `serialNum` and `guardianUrl` populated.
+ * Asks the facilitator for a server-generated `serial_num`. Returns the
+ * requirements with `extra.serialNum` populated. Authenticates the call
+ * with `config.merchantAuth` when supplied.
  */
-export async function acquireGuardianChallenge(
+export async function acquireChallenge(
   requirements: MidenPaymentRequirements,
   config: PaywallConfig,
 ): Promise<MidenPaymentRequirements> {
   const fetchImpl = config.fetch ?? fetch;
   const base = config.facilitatorUrl.replace(/\/$/, '');
-  const response = await fetchImpl(`${base}/guardian/challenge`, {
+  const body = JSON.stringify({ paymentRequirements: requirements });
+  const headers: Record<string, string> = { 'content-type': 'application/json' };
+  if (config.merchantAuth) {
+    Object.assign(headers, await config.merchantAuth.signRequest(body));
+  }
+  const response = await fetchImpl(`${base}/x402/challenge`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ paymentRequirements: requirements }),
+    headers,
+    body,
   });
   if (!response.ok) {
     throw new Error(
-      `facilitator /guardian/challenge returned ${response.status}: ${await response.text()}`,
+      `facilitator /x402/challenge returned ${response.status}: ${await response.text()}`,
     );
   }
-  const body = (await response.json()) as {
-    serialNum: HexId;
-    expiresInSeconds: number;
-  };
+  const json = (await response.json()) as ChallengeResponse;
   return {
     ...requirements,
-    extra: {
-      ...requirements.extra,
-      serialNum: body.serialNum,
-      guardianUrl: base,
-    },
+    extra: { ...requirements.extra, serialNum: json.serialNum },
   };
 }
 
@@ -148,21 +151,19 @@ export function buildPaymentRequired(
   price: PriceTag,
   resource: ResourceInfo,
   error?: string,
+  serialNum?: HexId,
 ): MidenPaymentRequired {
+  const requirements = buildRequirements(price);
+  if (serialNum) requirements.extra.serialNum = serialNum;
   const body: MidenPaymentRequired = {
     x402Version: 2,
-    accepts: [buildRequirements(price)],
+    accepts: [requirements],
     resource,
   };
   if (error) body.error = error;
   return body;
 }
 
-/**
- * Decodes a `Payment-Signature` header value into the canonical payload.
- * Returns `null` if the header is missing or unparseable. Callers should
- * treat `null` as "buyer has not paid yet; serve a 402".
- */
 export function tryDecodeSignature(headerValue: string | undefined): MidenPaymentPayload | null {
   if (!headerValue) return null;
   try {
@@ -181,12 +182,9 @@ export function encodeResponseHeader(body: SettleResponse): string {
 }
 
 /**
- * Calls the facilitator's `/settle`. Returns either the success body or an
- * error message suitable for the second 402's `error` field.
- *
- * We only call `/settle` (not `/verify` first) because under the Miden
- * settled-at-commit model `/settle` re-runs the same checks as `/verify`
- * and is idempotent. Skipping the extra hop halves the round-trip latency.
+ * Calls the Guardian-facilitator's `/x402/settle`. Returns either the
+ * success body (with `receiptSig` for the merchant to retain) or an error
+ * message suitable for a follow-up 402's `error` field.
  */
 export async function settleWithFacilitator(
   payload: MidenPaymentPayload,
@@ -194,21 +192,20 @@ export async function settleWithFacilitator(
   config: PaywallConfig,
 ): Promise<VerifyResult> {
   const fetchImpl = config.fetch ?? fetch;
-  // Route to the right endpoint based on the negotiated settlement model.
-  const settlement: SettlementKind =
-    requirements.extra.settlement ?? 'commit';
-  const path = settlement === 'guardian-fast' ? '/guardian/settle' : '/settle';
+  const base = config.facilitatorUrl.replace(/\/$/, '');
+  const body = JSON.stringify({
+    x402Version: 2,
+    paymentPayload: payload,
+    paymentRequirements: requirements,
+  });
+  const headers: Record<string, string> = { 'content-type': 'application/json' };
+  if (config.merchantAuth) {
+    Object.assign(headers, await config.merchantAuth.signRequest(body));
+  }
+
   let response: Response;
   try {
-    response = await fetchImpl(`${config.facilitatorUrl.replace(/\/$/, '')}${path}`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        x402Version: 2,
-        paymentPayload: payload,
-        paymentRequirements: requirements,
-      }),
-    });
+    response = await fetchImpl(`${base}/x402/settle`, { method: 'POST', headers, body });
   } catch (e) {
     return { ok: false, error: `facilitator unreachable: ${(e as Error).message}` };
   }
@@ -217,26 +214,26 @@ export async function settleWithFacilitator(
     const text = await response.text();
     let reason = `facilitator returned ${response.status}`;
     try {
-      const body = JSON.parse(text) as {
+      const errBody = JSON.parse(text) as {
         invalidReason?: string;
         invalidReasonDetails?: string;
       };
-      reason = body.invalidReasonDetails || body.invalidReason || reason;
+      reason = errBody.invalidReasonDetails || errBody.invalidReason || reason;
     } catch {
       reason = text || reason;
     }
     return { ok: false, error: reason };
   }
 
-  const body = (await response.json()) as SettleResponse;
-  if (body.success) {
-    return { ok: true, settle: body };
+  const settleBody = (await response.json()) as SettleResponse;
+  if (settleBody.success) {
+    return { ok: true, settle: settleBody };
   }
-  return { ok: false, error: body.errorReason };
+  return { ok: false, error: settleBody.errorReason };
 }
 
 export type PaymentOutcome =
-  | { kind: 'paid'; settle: Extract<SettleResponse, { success: true }> }
+  | { kind: 'paid'; settle: SettleSuccess }
   | { kind: '402'; body: MidenPaymentRequired };
 
 /**
@@ -244,11 +241,10 @@ export type PaymentOutcome =
  * the resource info, and the price, returns a structured outcome the
  * framework adapter can translate into an HTTP response.
  *
- * For `price.settlement: 'guardian-fast'`, on the first request (no payment
- * header) this also acquires a server-generated `serial_num` from the
- * facilitator's `/guardian/challenge` endpoint and embeds it in the 402's
- * `extra.serialNum`. On the retry it forwards the signed unproven payload
- * to `/guardian/settle`.
+ * On the first request (no payment header) acquires a `serial_num` from the
+ * facilitator's `POST /x402/challenge` endpoint and embeds it in the 402's
+ * `extra.serialNum`. On the retry it forwards the signed unproven payload to
+ * `POST /x402/settle`.
  */
 export async function processPayment(args: {
   signatureHeader: string | undefined;
@@ -256,27 +252,21 @@ export async function processPayment(args: {
   resource: ResourceInfo;
   config: PaywallConfig;
 }): Promise<PaymentOutcome> {
-  const settlement = args.price.settlement ?? 'commit';
   const payload = tryDecodeSignature(args.signatureHeader);
   if (!payload) {
-    // First hit — emit a 402. For guardian-fast we go acquire a challenge.
     let requirements = buildRequirements(args.price);
-    if (settlement === 'guardian-fast') {
-      try {
-        requirements = await acquireGuardianChallenge(requirements, args.config);
-      } catch (e) {
-        // If the facilitator's challenge endpoint is unavailable, surface
-        // the error in the 402 body so the buyer sees something actionable.
-        return {
-          kind: '402',
-          body: {
-            x402Version: 2,
-            accepts: [requirements],
-            resource: args.resource,
-            error: `failed to acquire guardian challenge: ${(e as Error).message}`,
-          },
-        };
-      }
+    try {
+      requirements = await acquireChallenge(requirements, args.config);
+    } catch (e) {
+      return {
+        kind: '402',
+        body: {
+          x402Version: 2,
+          accepts: [requirements],
+          resource: args.resource,
+          error: `failed to acquire challenge: ${(e as Error).message}`,
+        },
+      };
     }
     return {
       kind: '402',
@@ -288,9 +278,6 @@ export async function processPayment(args: {
     };
   }
 
-  // Retry with a Payment-Signature header. Use the requirements echoed in
-  // `payload.accepted` (which carries the guardian challenge serialNum that
-  // we issued in the 402) rather than re-deriving from the price.
   const requirements = payload.accepted;
   const result = await settleWithFacilitator(payload, requirements, args.config);
   if (result.ok && result.settle) {
@@ -298,25 +285,35 @@ export async function processPayment(args: {
   }
   return {
     kind: '402',
-    body: buildPaymentRequired(args.price, args.resource, result.error ?? 'verification failed'),
+    body: buildPaymentRequired(
+      args.price,
+      args.resource,
+      result.error ?? 'verification failed',
+    ),
   };
 }
 
-/** Re-exported for advanced callers that want to verify without settling. */
+/** For advanced callers that want to verify without enqueueing. */
 export async function verifyWithFacilitator(
   payload: MidenPaymentPayload,
   requirements: MidenPaymentRequirements,
   config: PaywallConfig,
 ): Promise<VerifyResponse> {
   const fetchImpl = config.fetch ?? fetch;
-  const response = await fetchImpl(`${config.facilitatorUrl.replace(/\/$/, '')}/verify`, {
+  const base = config.facilitatorUrl.replace(/\/$/, '');
+  const body = JSON.stringify({
+    x402Version: 2,
+    paymentPayload: payload,
+    paymentRequirements: requirements,
+  });
+  const headers: Record<string, string> = { 'content-type': 'application/json' };
+  if (config.merchantAuth) {
+    Object.assign(headers, await config.merchantAuth.signRequest(body));
+  }
+  const response = await fetchImpl(`${base}/x402/verify`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      x402Version: 2,
-      paymentPayload: payload,
-      paymentRequirements: requirements,
-    }),
+    headers,
+    body,
   });
   return (await response.json()) as VerifyResponse;
 }

@@ -36,7 +36,11 @@ export function paywall(opts: HonoPaywallOptions): MiddlewareHandler {
         description: opts.description ?? new URL(c.req.url).pathname,
         mimeType: opts.mimeType,
       },
-      config: { facilitatorUrl: opts.facilitatorUrl, fetch: opts.fetch },
+      config: {
+        facilitatorUrl: opts.facilitatorUrl,
+        fetch: opts.fetch,
+        merchantAuth: opts.merchantAuth,
+      },
     });
 
     if (outcome.kind === 'paid') {

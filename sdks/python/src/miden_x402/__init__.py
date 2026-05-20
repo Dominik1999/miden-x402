@@ -1,4 +1,5 @@
-"""Merchant SDK for x402 v2 on Miden.
+"""Merchant SDK for the ``miden-p2id-private`` scheme on Miden via the
+Guardian-facilitator.
 
 See ``docs/protocol.md`` in the parent repo for the normative wire contract.
 """
@@ -7,6 +8,7 @@ from .core import (
     PaymentOutcome,
     PaywallConfig,
     PriceTag,
+    acquire_challenge,
     process_payment,
     settle_with_facilitator,
     verify_with_facilitator,
@@ -23,14 +25,18 @@ from .headers import (
     encode_payment_signature_header,
 )
 from .types import (
-    ASSET_TRANSFER_METHOD_P2ID,
-    EXACT_SCHEME,
+    MIDEN_MAINNET,
+    MIDEN_P2ID_PRIVATE_SCHEME,
     MIDEN_TESTNET,
-    MidenExactExtra,
+    ChallengeRequest,
+    ChallengeResponse,
+    FacilitatorPubkey,
+    MidenP2idPrivateExtra,
+    MidenP2idPrivatePayload,
     MidenPaymentPayload,
     MidenPaymentRequired,
     MidenPaymentRequirements,
-    PublicP2idPayload,
+    MidenWirePayload,
     SettleError,
     SettleResponse,
     SettleSuccess,
@@ -38,24 +44,29 @@ from .types import (
 )
 
 __all__ = [
-    "ASSET_TRANSFER_METHOD_P2ID",
-    "EXACT_SCHEME",
+    "MIDEN_MAINNET",
+    "MIDEN_P2ID_PRIVATE_SCHEME",
     "MIDEN_TESTNET",
-    "MidenExactExtra",
+    "ChallengeRequest",
+    "ChallengeResponse",
+    "FacilitatorPubkey",
+    "MidenP2idPrivateExtra",
+    "MidenP2idPrivatePayload",
     "MidenPaymentPayload",
     "MidenPaymentRequired",
     "MidenPaymentRequirements",
+    "MidenWirePayload",
     "PAYMENT_REQUIRED_HEADER",
     "PAYMENT_RESPONSE_HEADER",
     "PAYMENT_SIGNATURE_HEADER",
     "PaymentOutcome",
     "PaywallConfig",
     "PriceTag",
-    "PublicP2idPayload",
     "SettleError",
     "SettleResponse",
     "SettleSuccess",
     "VerifyResponse",
+    "acquire_challenge",
     "decode_payment_required_header",
     "decode_payment_response_header",
     "decode_payment_signature_header",

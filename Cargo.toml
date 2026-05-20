@@ -7,10 +7,13 @@ members = [
 
 [workspace.package]
 edition       = "2024"
-rust-version  = "1.85"
+rust-version  = "1.93"
 license       = "Apache-2.0"
 repository    = "https://github.com/ermvrs/miden-x402"
 
+# OpenZeppelin Guardian crates are consumed from the public github repo.
+# Currently pinned to `branch = "main"`; before a release, pin to a specific
+# tag (e.g. `tag = "v0.14.6"`) so the build is reproducible.
 [workspace.dependencies]
 # Shared primitives
 serde       = { version = "1", features = ["derive"] }
@@ -18,16 +21,30 @@ serde_json  = "1"
 thiserror   = "2"
 base64      = "0.22"
 async-trait = "0.1"
+hex         = "0.4"
+blake3      = "1"
+rand        = "0.9"
 
 # x402 protocol
 x402-types  = "1.4"
 
-# Miden
-miden-client    = { version = "0.14", features = ["tonic"] }
-miden-standards = "0.14"
+# Miden — pinned to match OZ Guardian's workspace (0.14.5)
+miden-protocol  = "=0.14.5"
+miden-client    = { version = "=0.14.5", features = ["tonic"] }
+miden-standards = "=0.14.5"
+miden-tx        = "=0.14.5"
+miden-remote-prover-client = "0.14"
+miden-crypto    = "0.23"
+
+# OpenZeppelin Guardian — git deps (see note above)
+guardian-server       = { git = "https://github.com/OpenZeppelin/guardian", branch = "main" }
+guardian-shared       = { git = "https://github.com/OpenZeppelin/guardian", branch = "main" }
+guardian-client       = { git = "https://github.com/OpenZeppelin/guardian", branch = "main" }
+miden-multisig-client = { git = "https://github.com/OpenZeppelin/guardian", branch = "main" }
+miden-rpc-client      = { git = "https://github.com/OpenZeppelin/guardian", branch = "main" }
 
 # HTTP / runtime / observability
-axum               = "0.8"
+axum               = { version = "0.8", features = ["macros"] }
 tokio              = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync"] }
 tower              = "0.5"
 tower-http         = { version = "0.6", features = ["trace", "cors"] }

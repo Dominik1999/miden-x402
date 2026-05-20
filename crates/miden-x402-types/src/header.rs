@@ -105,8 +105,7 @@ mod tests {
     use crate::ids::AccountIdHex;
     use crate::network::miden_testnet;
     use crate::scheme::{
-        AssetTransferMethodTag, ExactScheme, MidenExactExtra, MidenExactPayload, NoteKind,
-        PublicP2idPayload, SettlementKind,
+        MidenP2idPrivateExtra, MidenP2idPrivatePayload, MidenP2idPrivateScheme, MidenWirePayload,
     };
     use x402_types::proto::v2::{PaymentRequired, ResourceInfo, X402Version2};
 
@@ -120,20 +119,15 @@ mod tests {
 
     fn sample_requirements() -> MidenPaymentRequirements {
         MidenPaymentRequirements {
-            scheme: ExactScheme,
+            scheme: MidenP2idPrivateScheme,
             network: miden_testnet(),
             amount: "1000".to_owned(),
             pay_to: "0x103f8a1ad4b983104aec0412ab0b0d".parse().unwrap(),
             max_timeout_seconds: 120,
             asset: sample_account(),
-            extra: MidenExactExtra {
-                asset_transfer_method: AssetTransferMethodTag,
-                token_symbol: "USDC".to_owned(),
-                decimals: 6,
-                note_type: NoteKind::Public,
-                settlement: SettlementKind::Commit,
-                guardian_url: None,
-                serial_num: None,
+            extra: MidenP2idPrivateExtra {
+                note_tag: "weather.api".to_owned(),
+                serial_num: Some(sample_word('c').parse().unwrap()),
             },
         }
     }
@@ -141,11 +135,13 @@ mod tests {
     fn sample_payload() -> MidenPaymentPayload {
         MidenPaymentPayload {
             accepted: sample_requirements(),
-            payload: MidenExactPayload::Public(PublicP2idPayload {
-                note_id: sample_word('a').parse().unwrap(),
-                transaction_id: sample_word('b').parse().unwrap(),
+            payload: MidenWirePayload::from(MidenP2idPrivatePayload {
+                tx_inputs: "AAA=".to_owned(),
+                signature: "c2ln".to_owned(),
+                signed_summary: "c3VtbWFyeQ==".to_owned(),
+                expected_note_blob: "Zm9v".to_owned(),
+                serial_num: sample_word('c').parse().unwrap(),
                 sender: "0x857b06519e91e3a54538791bdbb0e2".parse().unwrap(),
-                block_num: 1_234_567,
                 asset: sample_account(),
                 amount: "1000".to_owned(),
             }),

@@ -1,5 +1,5 @@
 /**
- * x402 v2 wire-format types for the Miden `exact` scheme.
+ * x402 v2 wire-format types for the `miden-p2id-private` scheme.
  *
  * Mirrors the Rust crate `miden-x402-types`. JSON keys use camelCase and
  * match `docs/protocol.md` of the parent repo. Header constants and the
@@ -18,7 +18,7 @@ export const PAYMENT_RESPONSE_HEADER = 'Payment-Response';
 // ---------- Network ----------
 
 export const MIDEN_TESTNET = 'miden:testnet';
-export const MIDEN_MAINNET = 'miden:mainnet'; // reserved, unused in MVP
+export const MIDEN_MAINNET = 'miden:mainnet';
 
 export type MidenNetwork = typeof MIDEN_TESTNET | typeof MIDEN_MAINNET;
 
@@ -32,114 +32,68 @@ export type DecimalAmount = string;
 
 // ---------- Scheme types ----------
 
-export const EXACT_SCHEME = 'exact';
-export type ExactScheme = typeof EXACT_SCHEME;
+export const MIDEN_P2ID_PRIVATE_SCHEME = 'miden-p2id-private';
+export type MidenP2idPrivateScheme = typeof MIDEN_P2ID_PRIVATE_SCHEME;
 
-export const ASSET_TRANSFER_METHOD_P2ID = 'miden-p2id';
-export type AssetTransferMethodTag = typeof ASSET_TRANSFER_METHOD_P2ID;
-
-export type NoteKind = 'public' | 'private';
-
-/**
- * Settlement model. `commit` (default) = settled-at-commit; `guardian-fast`
- * = verify-before-prove via the Guardian facilitator endpoints.
- */
-export type SettlementKind = 'commit' | 'guardian-fast';
-
-export interface MidenExactExtra {
-  assetTransferMethod: AssetTransferMethodTag;
-  tokenSymbol: string;
-  decimals: number;
-  noteType: NoteKind;
-  /** Optional. Defaults to `'commit'` when absent. */
-  settlement?: SettlementKind;
-  /** Required when `settlement: 'guardian-fast'`. URL of the Guardian facilitator. */
-  guardianUrl?: string;
-  /** Required when `settlement: 'guardian-fast'`. Server-generated 32-byte hex word. */
+export interface MidenP2idPrivateExtra {
+  /** Opaque tag the merchant uses to route incoming P2ID notes. */
+  noteTag: string;
+  /**
+   * Server-issued 32-byte `serial_num` (canonical hex). Required when the
+   * 402 is the result of a `POST /x402/challenge` round-trip; absent on the
+   * initial bootstrap call before the merchant has obtained one.
+   */
   serialNum?: HexId;
 }
 
 export interface MidenPaymentRequirements {
-  scheme: ExactScheme;
+  scheme: MidenP2idPrivateScheme;
   network: MidenNetwork;
   amount: DecimalAmount;
   asset: HexId;
   payTo: HexId;
   maxTimeoutSeconds: number;
-  extra: MidenExactExtra;
-}
-
-export interface PublicP2idPayload {
-  noteType: 'public';
-  noteId: HexId;
-  transactionId: HexId;
-  sender: HexId;
-  blockNum: number;
-  asset: HexId;
-  amount: DecimalAmount;
+  extra: MidenP2idPrivateExtra;
 }
 
 /**
- * Private-note payment payload.
+ * Wire payload for a `miden-p2id-private` payment.
  *
- * Carries the canonical Miden `NoteFile` (base64-encoded) so the facilitator
- * can reconstruct the note off-chain and bind it to the on-chain commitment
- * by recomputing the note id. The remaining fields mirror
- * {@link PublicP2idPayload} so the wire envelope is uniform across both note
- * types and the merchant can produce the same `SettleResponse::Success`
- * shape regardless of `noteType`.
+ * Carries a signed-but-unproven Miden transaction. The Guardian-facilitator
+ * verifies the Falcon signature against one of the buyer's cosigner
+ * commitments, reserves the input nullifiers, and asynchronously proves +
+ * submits the tx via its batch worker. There is no `blockNum` because the
+ * tx has not yet been included in a block at payload-construction time, and
+ * there is no `transactionId` because the only meaningful id is the
+ * post-prove `ProvenTransaction.id()` returned in the settle receipt.
  */
-export interface PrivateP2idPayload {
-  noteType: 'private';
-  /** Base64-encoded canonical NoteFile blob. */
-  noteBlob: string;
-  transactionId: HexId;
-  sender: HexId;
-  blockNum: number;
-  asset: HexId;
-  amount: DecimalAmount;
-}
-
-/**
- * Guardian-fast payment payload.
- *
- * Carries a signed-but-unproven Miden transaction. The facilitator verifies
- * the Falcon signature offline, reserves the input nullifiers, and proves +
- * submits the tx asynchronously. Unlike the commit variants, there is no
- * `blockNum` because the tx has not yet been included in a block at
- * payload-construction time, and `transactionId` is the pre-prove id —
- * the post-prove id is the one returned by `/guardian/settle`.
- */
-export interface GuardianFastPayload {
-  noteType: 'guardianFast';
-  /** Base64-encoded canonical TransactionInputs. */
+export interface MidenP2idPrivatePayload {
+  noteType: typeof MIDEN_P2ID_PRIVATE_SCHEME;
+  /** Base64-encoded canonical `miden_protocol::transaction::TransactionInputs`. */
   txInputs: string;
   /**
    * Base64-encoded `miden_protocol::account::auth::Signature` over the
-   * `TransactionSummary::to_commitment()` digest. Carried as a separate
-   * field because the advice-map encoding inside TransactionInputs is the
-   * stack-reversed prepared form, which can't be inverted back to the
-   * high-level Signature needed for offline verification.
+   * `TransactionSummary::to_commitment()` digest.
    */
   signature: string;
   /**
    * Base64-encoded `miden_protocol::transaction::TransactionSummary` — the
-   * value whose `.toCommitment()` the buyer signed. The Guardian binds it
-   * to `txInputs` (via input-notes commitment) and to `expectedNoteBlob`
-   * (via output-notes commitment) before verifying the signature.
+   * value whose `.to_commitment()` the buyer signed. The facilitator binds
+   * it to `txInputs` (via input-notes commitment) and to `expectedNoteBlob`
+   * (via output-notes membership) before verifying the signature.
    */
   signedSummary: string;
-  /** Base64-encoded NoteFile::NoteDetails for the expected output note. */
+  /** Base64-encoded `NoteFile::NoteDetails` for the expected output note. */
   expectedNoteBlob: string;
   /** Echo of `requirements.extra.serialNum`. */
   serialNum: HexId;
-  transactionId: HexId;
   sender: HexId;
   asset: HexId;
   amount: DecimalAmount;
 }
 
-export type MidenExactPayload = PublicP2idPayload | PrivateP2idPayload | GuardianFastPayload;
+/** Single-variant tagged wire payload — matches the Rust `MidenWirePayload`. */
+export type MidenWirePayload = MidenP2idPrivatePayload;
 
 // ---------- Top-level envelopes ----------
 
@@ -151,7 +105,7 @@ export interface ResourceInfo {
 
 export interface MidenPaymentRequired {
   x402Version: 2;
-  /** Populated on the second 402 after a failed verify (e.g. "note already consumed"). */
+  /** Populated on a second 402 after a failed verify. */
   error?: string;
   resource?: ResourceInfo;
   accepts: MidenPaymentRequirements[];
@@ -161,7 +115,7 @@ export interface MidenPaymentRequired {
 export interface MidenPaymentPayload {
   x402Version: 2;
   accepted: MidenPaymentRequirements;
-  payload: MidenExactPayload;
+  payload: MidenWirePayload;
   resource?: ResourceInfo;
   extensions?: Record<string, unknown>;
 }
@@ -180,11 +134,21 @@ export type VerifyResponse =
   | { isValid: true; payer: HexId }
   | { isValid: false; invalidReason: string; invalidReasonDetails?: string };
 
+/** Successful settle response from `POST /x402/settle`. */
 export interface SettleSuccess {
   success: true;
   payer: HexId;
+  /**
+   * Deterministic queued id (`blake3(serial_num || tx_summary_commitment)`).
+   * Resolves to the on-chain `ProvenTransaction.id()` once the batch worker
+   * settles.
+   */
   transaction: HexId;
   network: MidenNetwork;
+  /** Base64-encoded Falcon-512 signature over `RPO256([payer, queuedId, network])`. */
+  receiptSig: string;
+  /** Hex commitment of the facilitator's receipt-signing pubkey. */
+  receiptPubkeyCommitment: HexId;
 }
 
 export interface SettleError {
@@ -195,10 +159,32 @@ export interface SettleError {
 
 export type SettleResponse = SettleSuccess | SettleError;
 
+// ---------- Challenge endpoint ----------
+
+export interface ChallengeRequest {
+  paymentRequirements: MidenPaymentRequirements;
+}
+
+export interface ChallengeResponse {
+  serialNum: HexId;
+  expiresInSeconds: number;
+}
+
+// ---------- Pubkey endpoint ----------
+
+export interface FacilitatorPubkey {
+  /** Falcon-512 Poseidon2 pubkey commitment (canonical hex). */
+  commitment: HexId;
+  /** Base64 of the raw Falcon public-key bytes. */
+  pubkeyB64: string;
+}
+
+// ---------- Error reasons ----------
+
 /**
  * Canonical x402 `ErrorReason` values. The facilitator surfaces these
- * through `invalidReason` / `errorReason`; merchants forward them in the
- * `error` field of the second 402.
+ * through `invalidReason`/`errorReason`; merchants forward them in the
+ * `error` field of a follow-up 402.
  */
 export const ERROR_REASONS = [
   'insufficient_funds',
@@ -206,9 +192,13 @@ export const ERROR_REASONS = [
   'invalid_network',
   'invalid_payload',
   'invalid_transaction_state',
+  'invalid_signature',
+  'invalid_payment_amount',
   'unsupported_scheme',
-  'unexpected_verify_error',
-  'unexpected_settle_error',
+  'unsupported_chain',
+  'recipient_mismatch',
+  'asset_mismatch',
+  'unexpected_error',
 ] as const;
 
 export type ErrorReason = (typeof ERROR_REASONS)[number];

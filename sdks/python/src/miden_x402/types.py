@@ -1,24 +1,23 @@
-"""Pydantic models for the x402 v2 Miden wire format.
+"""Pydantic models for the `miden-p2id-private` wire format.
 
 JSON field names are camelCase to match ``docs/protocol.md``; Python
-attribute names are snake_case for ergonomics. Pydantic's ``populate_by_name``
-+ ``alias_generator`` mode lets both styles co-exist.
+attribute names are snake_case for ergonomics. Pydantic's
+``populate_by_name`` + ``alias_generator`` mode lets both styles co-exist.
 
 The shapes mirror :mod:`miden_x402_types` in the Rust workspace.
 """
 
 from __future__ import annotations
 
-from typing import Annotated, Any, Literal, Union
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 
 MIDEN_TESTNET = "miden:testnet"
-MIDEN_MAINNET = "miden:mainnet"  # reserved, unused in MVP
+MIDEN_MAINNET = "miden:mainnet"
 
-EXACT_SCHEME = "exact"
-ASSET_TRANSFER_METHOD_P2ID = "miden-p2id"
+MIDEN_P2ID_PRIVATE_SCHEME = "miden-p2id-private"
 
 
 class _WireModel(BaseModel):
@@ -31,88 +30,39 @@ class _WireModel(BaseModel):
     )
 
 
-class MidenExactExtra(_WireModel):
-    asset_transfer_method: Literal["miden-p2id"] = ASSET_TRANSFER_METHOD_P2ID
-    token_symbol: str
-    decimals: int
-    note_type: Literal["public", "private"] = "public"
-    # Settlement model. ``"commit"`` (default) = settled-at-commit;
-    # ``"guardian-fast"`` = verify-before-prove via the Guardian endpoints.
-    settlement: Literal["commit", "guardian-fast"] = "commit"
-    # Only meaningful with settlement == "guardian-fast".
-    guardian_url: str | None = None
-    # Server-generated 32-byte hex Word. Only meaningful with
-    # settlement == "guardian-fast".
+class MidenP2idPrivateExtra(_WireModel):
+    """`extra` field on the 402 response."""
+
+    note_tag: str
     serial_num: str | None = None
 
 
 class MidenPaymentRequirements(_WireModel):
-    scheme: Literal["exact"] = EXACT_SCHEME
+    scheme: Literal["miden-p2id-private"] = MIDEN_P2ID_PRIVATE_SCHEME
     network: str
     amount: str
     asset: str
     pay_to: str
     max_timeout_seconds: int = 120
-    extra: MidenExactExtra
+    extra: MidenP2idPrivateExtra
 
 
-class PublicP2idPayload(_WireModel):
-    note_type: Literal["public"] = "public"
-    note_id: str
-    transaction_id: str
-    sender: str
-    block_num: int
-    asset: str
-    amount: str
+class MidenP2idPrivatePayload(_WireModel):
+    """Signed-but-unproven payload — the only wire variant."""
 
-
-class PrivateP2idPayload(_WireModel):
-    """Private-note payment payload.
-
-    Carries the canonical Miden ``NoteFile`` blob (base64-encoded) so the
-    facilitator can reconstruct the note off-chain and bind it to the
-    on-chain commitment by recomputing the note id. Other fields mirror
-    :class:`PublicP2idPayload` so the wire envelope is uniform across both
-    note types.
-    """
-
-    note_type: Literal["private"] = "private"
-    note_blob: str
-    transaction_id: str
-    sender: str
-    block_num: int
-    asset: str
-    amount: str
-
-
-class GuardianFastPayload(_WireModel):
-    """Guardian-fast payment payload.
-
-    Carries a signed-but-unproven transaction. The facilitator verifies the
-    Falcon signature offline, reserves input nullifiers, and proves +
-    submits the tx asynchronously. ``transaction_id`` is the pre-prove id.
-    There is no ``block_num`` field — the tx is not yet on chain at the
-    time the payload is constructed.
-    """
-
-    note_type: Literal["guardianFast"] = "guardianFast"
+    note_type: Literal["miden-p2id-private"] = MIDEN_P2ID_PRIVATE_SCHEME
     tx_inputs: str
-    # Base64 of miden_protocol::account::auth::Signature.
     signature: str
-    # Base64 of miden_protocol::transaction::TransactionSummary.
     signed_summary: str
     expected_note_blob: str
     serial_num: str
-    transaction_id: str
     sender: str
     asset: str
     amount: str
 
 
-MidenExactPayload = Annotated[
-    Union[PublicP2idPayload, PrivateP2idPayload, GuardianFastPayload],
-    Field(discriminator="note_type"),
-]
+# Type alias kept for ergonomics; single-variant for now.
+MidenWirePayload = MidenP2idPrivatePayload
 
 
 class ResourceInfo(_WireModel):
@@ -132,7 +82,7 @@ class MidenPaymentRequired(_WireModel):
 class MidenPaymentPayload(_WireModel):
     x402_version: Literal[2] = 2
     accepted: MidenPaymentRequirements
-    payload: MidenExactPayload
+    payload: MidenWirePayload
     resource: ResourceInfo | None = None
     extensions: dict[str, Any] | None = None
 
@@ -151,17 +101,18 @@ class VerifyInvalid(_WireModel):
     invalid_reason_details: str | None = None
 
 
-VerifyResponse = Annotated[
-    Union[VerifyValid, VerifyInvalid],
-    Field(discriminator="is_valid"),
-]
+VerifyResponse = VerifyValid | VerifyInvalid
 
 
 class SettleSuccess(_WireModel):
+    """Successful settle response from `POST /x402/settle`."""
+
     success: Literal[True] = True
     payer: str
     transaction: str
     network: str
+    receipt_sig: str
+    receipt_pubkey_commitment: str
 
 
 class SettleError(_WireModel):
@@ -170,7 +121,24 @@ class SettleError(_WireModel):
     error_reason_details: str | None = None
 
 
-SettleResponse = Annotated[
-    Union[SettleSuccess, SettleError],
-    Field(discriminator="success"),
-]
+SettleResponse = SettleSuccess | SettleError
+
+
+# ---------- Challenge endpoint ----------
+
+
+class ChallengeRequest(_WireModel):
+    payment_requirements: MidenPaymentRequirements
+
+
+class ChallengeResponse(_WireModel):
+    serial_num: str
+    expires_in_seconds: int
+
+
+# ---------- Pubkey endpoint ----------
+
+
+class FacilitatorPubkey(_WireModel):
+    commitment: str
+    pubkey_b64: str = Field(alias="pubkeyB64")

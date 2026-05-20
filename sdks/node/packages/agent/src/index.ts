@@ -1,54 +1,50 @@
 /**
- * Agent client for x402 v2 on Miden.
+ * Agent client for the `miden-p2id-private` scheme on Miden via the
+ * Guardian-facilitator.
  *
- * Wraps a `fetch` implementation so that 402 responses trigger a P2ID
- * note payment (built via the configured `Payer`) and the original
- * request is retried with the `Payment-Signature` header attached.
+ * Wraps a `fetch` so a 402 response triggers an unproven Miden tx build
+ * (via the configured {@link Payer}), and the original request is retried
+ * with the `Payment-Signature` header attached.
  *
- * Wire details follow `docs/protocol.md` §A. The `accepted` object echoed
- * in the `Payment-Signature` payload MUST be the exact same object the
+ * Wire details follow `docs/protocol.md`. The `accepted` object echoed in
+ * the `Payment-Signature` payload MUST be the exact same object the
  * merchant offered, including unknown future fields.
  */
 
 import {
-  ASSET_TRANSFER_METHOD_P2ID,
-  EXACT_SCHEME,
-  MIDEN_TESTNET,
+  MIDEN_P2ID_PRIVATE_SCHEME,
   PAYMENT_REQUIRED_HEADER,
   PAYMENT_RESPONSE_HEADER,
   PAYMENT_SIGNATURE_HEADER,
   decodePaymentRequiredHeader,
   decodePaymentResponseHeader,
   encodePaymentSignatureHeader,
-  type GuardianFastPayload,
-  type MidenExactPayload,
   type MidenPaymentPayload,
   type MidenPaymentRequired,
   type MidenPaymentRequirements,
-  type PrivateP2idPayload,
-  type PublicP2idPayload,
-  type SettleResponse,
+  type SettleSuccess,
 } from '@miden-x402/types';
 
 import type { Payer } from './payer.js';
 
-export type { Payer, P2idPaymentReceipt, P2idPaymentRequest } from './payer.js';
+export { StubPayer, PayerNotImplemented } from './payer.js';
+export type { Payer, UnprovenTxRequest } from './payer.js';
 export {
   PAYMENT_REQUIRED_HEADER,
   PAYMENT_SIGNATURE_HEADER,
   PAYMENT_RESPONSE_HEADER,
 };
-export { createWasmSdkPayer, WasmSdkPayerError } from './wasm-sdk-payer.js';
-export type { WasmSdkPayerOptions } from './wasm-sdk-payer.js';
 
 export interface AgentOptions {
-  /** Implementation that builds + proves + submits the P2ID note. */
+  /** The buyer's Miden account id (canonical hex). */
+  buyerAccountId: string;
+  /** Implementation that builds + signs the unproven Miden transaction. */
   payer: Payer;
   /**
-   * Optional callback fired with the merchant's `Payment-Response` settle
-   * body once the request succeeds. Useful for logging transaction ids.
+   * Optional callback fired with the facilitator's settle receipt once
+   * delivery succeeds. Useful for logging or persisting `queuedId`.
    */
-  onSettlement?: (settle: Extract<SettleResponse, { success: true }>) => void;
+  onSettlement?: (settle: SettleSuccess) => void;
   /**
    * Optional callback fired right before retrying with the signed payload.
    * Lets callers inspect or store the receipt.
@@ -57,12 +53,11 @@ export interface AgentOptions {
 }
 
 /**
- * Wraps a `fetch` so that 402 responses are paid for and the original
- * request is automatically retried with `Payment-Signature` attached.
+ * Wraps a `fetch` so 402 responses are paid for and the original request
+ * is automatically retried with `Payment-Signature` attached.
  *
- * Note: the wrapped fetch retries the request **once**. If the merchant
- * still returns 402 after a successful payment (e.g. the facilitator
- * rejected the note as already-consumed), the 402 is propagated to the
+ * The wrapped fetch retries the request **once**. If the merchant returns
+ * 402 again after a successful payment, the 402 is propagated to the
  * caller with the merchant's error body.
  */
 export function withMidenX402(baseFetch: typeof fetch, opts: AgentOptions): typeof fetch {
@@ -82,80 +77,28 @@ export function withMidenX402(baseFetch: typeof fetch, opts: AgentOptions): type
     if (!requirements) {
       return response;
     }
-
-    const settlement = requirements.extra.settlement ?? 'commit';
-
-    let inner: MidenExactPayload;
-    if (settlement === 'guardian-fast') {
-      if (typeof opts.payer.payP2IDUnproven !== 'function') {
-        throw new Error(
-          'agent: requirements demand settlement="guardian-fast" but the configured Payer does not implement payP2IDUnproven',
-        );
-      }
-      if (!requirements.extra.serialNum) {
-        throw new Error(
-          'agent: guardian-fast requirements are missing extra.serialNum (the server-generated challenge)',
-        );
-      }
-      const receipt = await opts.payer.payP2IDUnproven({
-        payTo: requirements.payTo,
-        asset: requirements.asset,
-        amount: requirements.amount,
-        serialNum: requirements.extra.serialNum,
-      });
-      inner = {
-        noteType: 'guardianFast',
-        txInputs: receipt.txInputs,
-        signature: receipt.signature,
-        signedSummary: receipt.signedSummary,
-        expectedNoteBlob: receipt.expectedNoteBlob,
-        serialNum: requirements.extra.serialNum,
-        transactionId: receipt.transactionId,
-        sender: receipt.sender,
-        asset: requirements.asset,
-        amount: requirements.amount,
-      } satisfies GuardianFastPayload;
-    } else {
-      const receipt = await opts.payer.payP2ID({
-        payTo: requirements.payTo,
-        asset: requirements.asset,
-        amount: requirements.amount,
-        noteType: requirements.extra.noteType,
-      });
-      if (requirements.extra.noteType === 'private') {
-        if (!receipt.noteBlob) {
-          throw new Error(
-            'agent: payer returned no noteBlob for a private-note request; the Payer impl must export the canonical NoteFile for private payments',
-          );
-        }
-        inner = {
-          noteType: 'private',
-          noteBlob: receipt.noteBlob,
-          transactionId: receipt.transactionId,
-          sender: receipt.sender,
-          blockNum: receipt.blockNum,
-          asset: requirements.asset,
-          amount: requirements.amount,
-        } satisfies PrivateP2idPayload;
-      } else {
-        inner = {
-          noteType: 'public',
-          noteId: receipt.noteId,
-          transactionId: receipt.transactionId,
-          sender: receipt.sender,
-          blockNum: receipt.blockNum,
-          asset: requirements.asset,
-          amount: requirements.amount,
-        } satisfies PublicP2idPayload;
-      }
+    const serialNum = requirements.extra.serialNum;
+    if (!serialNum) {
+      throw new Error(
+        'agent: 402 is missing extra.serialNum — merchant must call POST /x402/challenge ' +
+          'before emitting the 402 (see docs/protocol.md)',
+      );
     }
+
+    const inner = await opts.payer.buildUnprovenPayment({
+      buyerAccountId: opts.buyerAccountId,
+      payTo: requirements.payTo,
+      asset: requirements.asset,
+      amount: requirements.amount,
+      serialNum,
+      noteTag: requirements.extra.noteTag,
+    });
 
     const payload: MidenPaymentPayload = {
       x402Version: 2,
       accepted: requirements,
       payload: inner,
     };
-
     opts.onPaymentBuilt?.(payload);
 
     const signedInit = withSignatureHeader(init, encodePaymentSignatureHeader(payload));
@@ -168,7 +111,7 @@ export function withMidenX402(baseFetch: typeof fetch, opts: AgentOptions): type
           const settle = decodePaymentResponseHeader(settleHeader);
           if (settle.success) opts.onSettlement(settle);
         } catch {
-          // Ignore: merchants are allowed to omit the header.
+          // Header is optional / merchants may omit.
         }
       }
     }
@@ -177,17 +120,8 @@ export function withMidenX402(baseFetch: typeof fetch, opts: AgentOptions): type
 }
 
 function pickMidenAccept(req: MidenPaymentRequired): MidenPaymentRequirements | null {
-  // Both public and private noteType variants are supported; the agent
-  // forwards the merchant's choice to the Payer.
   for (const accept of req.accepts) {
-    if (
-      accept.scheme === EXACT_SCHEME &&
-      accept.network === MIDEN_TESTNET &&
-      accept.extra.assetTransferMethod === ASSET_TRANSFER_METHOD_P2ID &&
-      (accept.extra.noteType === 'public' || accept.extra.noteType === 'private')
-    ) {
-      return accept;
-    }
+    if (accept.scheme === MIDEN_P2ID_PRIVATE_SCHEME) return accept;
   }
   return null;
 }

@@ -1,19 +1,21 @@
 # miden-x402 wire protocol
 
-This document is the **normative contract** between the buyer, the merchant, and
-the facilitator. Anyone porting the merchant middleware or buyer client to a
-new language (Node, Python, Go, etc.) implements against this document.
+This document is the **normative contract** between the buyer, the merchant,
+and the Guardian-facilitator. Anyone porting the merchant middleware or
+buyer client to a new language (Node, Python, Go, etc.) implements against
+this document.
+
+The design that drives this protocol lives at
+[`ideas/DESIGN.md`](../ideas/DESIGN.md): use the OpenZeppelin Guardian as
+the x402 facilitator, with verify-before-prove and batched settlement.
 
 There are two distinct HTTP exchanges:
 
 - **A. Public payment exchange.** Buyer ↔ merchant. Three HTTP headers carry
   the payment data; the rest of the request is the buyer's normal API call.
-- **B. Back-end facilitator API.** Merchant ↔ facilitator. JSON request/response
-  bodies. The merchant calls this from its own server; buyers never see it.
-
-The Rust reference implementation of (A) for merchants is forthcoming
-(Node and Python SDKs in M4/M5). The reference implementation of (B) is
-[`miden-x402-facilitator`](../crates/miden-x402-facilitator).
+- **B. Back-end facilitator API.** Merchant ↔ Guardian-facilitator (and
+  buyer ↔ Guardian-facilitator). JSON request/response bodies, plus
+  Guardian-style auth headers on every authenticated route.
 
 All JSON examples use `camelCase` keys. All identifiers are lowercase
 `0x`-prefixed hex. All amounts are decimal strings of atomic token units.
@@ -31,16 +33,12 @@ All JSON examples use `camelCase` keys. All identifiers are lowercase
 | `PAYMENT_RESPONSE_HEADER` | `Payment-Response` | merchant → buyer (`200`) | base64(JSON(`SettleResponse`)) |
 
 Base64 alphabet is **standard** (RFC 4648 §4, `+`/`/` with `=` padding).
-Header names are case-insensitive on the wire per RFC 9110; emit them in
-TitleCase as shown so that case-sensitive HTTP/2 indexes hit the canonical
-form.
 
 ### A.2 Step-by-step
 
 #### A.2.1 Initial request
 
-Buyer makes a normal HTTP request to the protected resource. No
-payment-related headers attached:
+Buyer makes a normal HTTP request. No payment headers attached:
 
 ```http
 GET /weather HTTP/1.1
@@ -48,17 +46,20 @@ Host: api.example.com
 Accept: application/json
 ```
 
-#### A.2.2 `402 Payment Required`
+#### A.2.2 Merchant calls the facilitator's `/x402/challenge`
 
-Merchant detects the missing `Payment-Signature`, builds a `PaymentRequired`,
-and responds:
+Before emitting the 402, the merchant gets a server-generated `serial_num`
+from the Guardian-facilitator (see §B.1). The merchant authenticates this
+call as itself (Guardian-style `x-pubkey`/`x-signature`/`x-timestamp`).
+
+#### A.2.3 `402 Payment Required`
 
 ```http
 HTTP/1.1 402 Payment Required
-Payment-Required: eyJ4NDAyVmVyc2lvbiI6Miwi...  # base64(JSON(PaymentRequired))
+Payment-Required: eyJ4NDAyVmVyc2lvbiI6Miwi...   # base64(JSON(PaymentRequired))
 ```
 
-The header value, base64-decoded, is the JSON:
+The header value, base64-decoded:
 
 ```json
 {
@@ -70,47 +71,60 @@ The header value, base64-decoded, is the JSON:
   },
   "accepts": [
     {
-      "scheme": "exact",
+      "scheme": "miden-p2id-private",
       "network": "miden:testnet",
       "amount": "1000",
       "asset": "0x0a7d175ed63ec5200fb2ced86f6aa5",
       "payTo": "0x103f8a1ad4b983104aec0412ab0b0d",
       "maxTimeoutSeconds": 120,
       "extra": {
-        "assetTransferMethod": "miden-p2id",
-        "tokenSymbol": "USDC",
-        "decimals": 6,
-        "noteType": "public"
+        "noteTag": "weather.api",
+        "serialNum": "0xcccc...cc"
       }
     }
   ]
 }
 ```
 
-The response body MAY be empty. Merchants that want their `402` to be
-introspection-friendly MAY duplicate the payload as the response body with
-`Content-Type: application/json` — the buyer SDK MUST treat the header as
-authoritative.
+Notes:
 
-#### A.2.3 Buyer creates a P2ID note on Miden
+- `scheme` is always `"miden-p2id-private"` — this protocol only carries
+  the private-note, verify-before-prove path. There is no public-note or
+  settled-at-commit variant.
+- `network` uses x402 v2 CAIP-2 form (`namespace:reference`). DESIGN.md
+  uses the casual `"miden-mainnet"` form; the on-the-wire value is
+  `"miden:mainnet"` (or `"miden:testnet"`). See
+  [`docs/UPSTREAM_WISHLIST.md`](./UPSTREAM_WISHLIST.md) for why.
+- `extra.noteTag` is an opaque tag the merchant uses to route incoming
+  P2ID notes.
+- `extra.serialNum` is the server-issued `serial_num` the merchant
+  acquired from `POST /x402/challenge`. The buyer MUST use this exact
+  value when constructing the P2ID note.
 
-Outside the HTTP exchange, the buyer uses a Miden client (Rust SDK,
-`@miden-sdk/miden-sdk`, etc.) to:
+#### A.2.4 Buyer constructs a signed-but-unproven Miden transaction
 
-1. Build a `P2idNote` whose recipient is `accepts[0].payTo` and whose single
-   fungible asset has faucet ID `accepts[0].asset` and amount
-   `accepts[0].amount` (atomic units, parsed as `u64`).
-2. Prove and submit the create-note transaction to Miden testnet.
-3. Wait for the note to enter a committed block. Record the resulting
-   `noteId`, `transactionId`, and `blockNum`.
+Outside the HTTP exchange, the buyer uses a Miden client (e.g.
+`miden-multisig-client` from the OZ Guardian repo) to:
 
-#### A.2.4 Retry with `Payment-Signature`
+1. Build a `P2idNote` with recipient = `accepts[0].payTo`, asset =
+   `accepts[0].asset`, amount = `accepts[0].amount`, and `serial_num`
+   = `accepts[0].extra.serialNum`.
+2. Build a `TransactionInputs` that consumes the buyer's funds and
+   creates this P2ID note as output.
+3. Execute the transaction locally **without proving** to obtain a
+   canonical `TransactionSummary`.
+4. Sign `TransactionSummary::to_commitment()` with a Falcon-512 cosigner
+   key authorised on the buyer account.
+
+The buyer does NOT prove or submit the tx to the Miden node. The
+Guardian-facilitator does that asynchronously after verifying.
+
+#### A.2.5 Retry with `Payment-Signature`
 
 ```http
 GET /weather HTTP/1.1
 Host: api.example.com
-Accept: application/json
-Payment-Signature: eyJhY2NlcHRlZCI6eyJzY2hl...  # base64(JSON(PaymentPayload))
+Payment-Signature: eyJ4NDAyVmVyc2lvbiI6Miwi...  # base64(JSON(PaymentPayload))
 ```
 
 The header value, base64-decoded:
@@ -118,73 +132,35 @@ The header value, base64-decoded:
 ```json
 {
   "x402Version": 2,
-  "accepted": {
-    "scheme": "exact",
-    "network": "miden:testnet",
-    "amount": "1000",
-    "asset": "0x0a7d175ed63ec5200fb2ced86f6aa5",
-    "payTo": "0x103f8a1ad4b983104aec0412ab0b0d",
-    "maxTimeoutSeconds": 120,
-    "extra": {
-      "assetTransferMethod": "miden-p2id",
-      "tokenSymbol": "USDC",
-      "decimals": 6,
-      "noteType": "public"
-    }
-  },
+  "accepted": { /* the exact `accepts[i]` the merchant offered */ },
   "payload": {
-    "noteType": "public",
-    "noteId": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "transactionId": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-    "sender": "0x857b06519e91e3a54538791bdbb0e2",
-    "blockNum": 1234567,
-    "asset": "0x0a7d175ed63ec5200fb2ced86f6aa5",
-    "amount": "1000"
+    "noteType": "miden-p2id-private",
+    "txInputs":         "<base64(TransactionInputs)>",
+    "signature":        "<base64(Signature)>",
+    "signedSummary":    "<base64(TransactionSummary)>",
+    "expectedNoteBlob": "<base64(NoteFile::NoteDetails)>",
+    "serialNum":        "0xcccc...cc",
+    "sender":           "0x857b06519e91e3a54538791bdbb0e2",
+    "asset":            "0x0a7d175ed63ec5200fb2ced86f6aa5",
+    "amount":           "1000"
   }
 }
 ```
 
 The buyer SDK MUST set `accepted` to **the exact same object** the merchant
-offered — including unknown future fields. The merchant compares the offered
-requirements against the echoed `accepted` to detect tampering.
+offered, including unknown future fields.
 
-For `noteType: "private"`, the payload replaces `noteId` with `noteBlob`
-(base64-encoded `NoteFile`); all other receipt fields are identical:
+#### A.2.6 Merchant calls the facilitator's `/x402/settle`
 
-```json
-{
-  "x402Version": 2,
-  "accepted": { /* same shape; extra.noteType is "private" */ },
-  "payload": {
-    "noteType": "private",
-    "noteBlob": "bm90ZQEK...<base64 of canonical NoteFile>",
-    "transactionId": "0xbbbb...",
-    "sender":        "0x857b06519e91e3a54538791bdbb0e2",
-    "blockNum":      1234567,
-    "asset":         "0x0a7d175ed63ec5200fb2ced86f6aa5",
-    "amount":        "1000"
-  }
-}
-```
+The merchant forwards the decoded payload + the matched requirements to
+`POST /x402/settle` (see §B.3), authenticating itself.
 
-The facilitator decodes the `NoteFile`, extracts recipient/asset from the
-off-chain note, recomputes the `noteId`, and binds the blob to the on-chain
-commitment by looking it up via `GetNotesById` — the result is
-`FetchedNote::Private(NoteHeader, NoteInclusionProof)` from which sender and
-block number are read. The same 11 verification rules apply; only the source
-of recipient/asset differs between the two note types.
-
-#### A.2.5 Merchant verifies via the facilitator
-
-The merchant POSTs to the facilitator (see section B). On success, the
-facilitator returns a `SettleResponse::Success`.
-
-#### A.2.6 Successful response
+#### A.2.7 Successful response
 
 ```http
 HTTP/1.1 200 OK
 Content-Type: application/json
-Payment-Response: eyJzdWNjZXNzIjp0cnVlLCJw...  # base64(JSON(SettleResponse))
+Payment-Response: eyJzdWNjZXNzIjp0cnVlLCJw...   # base64(JSON(SettleResponse))
 
 { "temperature": 21.5, "city": "Istanbul" }
 ```
@@ -195,82 +171,31 @@ The header value, base64-decoded:
 {
   "success": true,
   "payer": "0x857b06519e91e3a54538791bdbb0e2",
-  "transaction": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-  "network": "miden:testnet"
+  "transaction": "0xqueued_id...",
+  "network": "miden:testnet",
+  "receiptSig": "<base64(Falcon signature)>",
+  "receiptPubkeyCommitment": "0xfacilitator_pubkey_commitment..."
 }
 ```
 
-`transaction` is the **buyer's create-note transaction id**, because under
-the Miden settled-at-commit model that is the on-chain event that finalised
-the payment. The merchant never produces a new on-chain tx of its own
-(consumption of the note happens out of band, on the merchant's own
-schedule).
-
-#### A.2.7 Guardian-fast variant (verify-before-prove)
-
-When `accepts[*].extra.settlement == "guardian-fast"`, the buyer hands the
-facilitator a *signed but not proven* transaction; the facilitator verifies
-the Falcon signature offline, reserves the input nullifier(s), and proves +
-submits the tx asynchronously via a configured remote prover.
-
-The merchant's 402 acquires a server-issued `serial_num` from the
-facilitator's `POST /guardian/challenge` endpoint before emitting the
-response. The buyer must use that exact `serial_num` when constructing the
-P2ID note so the Guardian's pre-computed nullifier matches.
-
-402 `extra` shape for `guardian-fast`:
-
-```json
-{
-  "assetTransferMethod": "miden-p2id",
-  "tokenSymbol": "USDC",
-  "decimals": 6,
-  "noteType": "private",
-  "settlement": "guardian-fast",
-  "guardianUrl": "https://facilitator.miden.io",
-  "serialNum": "0x<32-byte server-generated word>"
-}
-```
-
-`Payment-Signature` payload variant for `guardian-fast` (base64-decoded):
-
-```json
-{
-  "noteType": "guardianFast",
-  "txInputs":         "<base64(TransactionInputs)>",
-  "signature":        "<base64(miden_protocol::account::auth::Signature)>",
-  "signedSummary":    "<base64(miden_protocol::transaction::TransactionSummary)>",
-  "expectedNoteBlob": "<base64(NoteFile::NoteDetails)>",
-  "serialNum":        "0x...",
-  "transactionId":    "0x...",
-  "sender":           "0x...",
-  "asset":            "0x...",
-  "amount":           "1000"
-}
-```
-
-`signedSummary` is the canonical `TransactionSummary` whose
-`to_commitment()` digest the buyer's Falcon signature authorizes. The
-facilitator binds it to `txInputs` (via `input_notes_commitment`) and to
-`expectedNoteBlob` (via membership in `output_notes`), then verifies the
-signature against the on-chain `PublicKeyCommitment` extracted from
-`txInputs.account()` storage.
-
-Trust model is identical to Base's x402 facilitator: the merchant trusts
-the Guardian's `Payment-Response` verification message and delivers the
-resource. On-chain inclusion is post-hoc; the returned `transaction` field
-is the post-prove `ProvenTransaction.id()`, NOT the pre-prove id echoed in
-`txInputs`.
+- `transaction` is the deterministic **queued id** (`blake3(serial_num ||
+  signed_summary.commitment())`), not yet the on-chain id. The facilitator
+  resolves it to the post-prove `ProvenTransaction.id()` once the batch
+  worker drains. Clients can look it up later via the facilitator's
+  internal mapping (out of scope for this document).
+- `receiptSig` is a Falcon-512 signature over `RPO256([payer, queuedId,
+  networkHash])` produced by the facilitator's own receipt-signing key.
+  Merchants cache the facilitator's pubkey via `GET /x402/pubkey` and
+  retain receipts for accounting / auditing.
 
 ### A.3 Error responses
 
-If verification fails the merchant returns the same `402 Payment Required`
-flow as A.2.2, with `error` populated:
+If verification fails the merchant returns another 402:
 
 ```json
 {
   "x402Version": 2,
-  "error": "note already consumed",
+  "error": "input nullifier already reserved in pending window",
   "resource": { /* ... */ },
   "accepts": [ /* ... */ ]
 }
@@ -280,87 +205,35 @@ Merchants MUST NOT return the resource body when verification fails.
 
 ---
 
-## B. Back-end facilitator API (merchant ↔ facilitator)
+## B. Back-end facilitator API (merchant/buyer ↔ Guardian-facilitator)
 
-The facilitator is a plain HTTP+JSON service. There are no `Payment-*` headers
-in this exchange — the merchant simply forwards the decoded payload + the
-matched requirements as a JSON body.
+The Guardian-facilitator is an OZ Guardian server with the x402 module
+mounted (single binary, single process, single port). Routes under `/`
+are Guardian's standard routes (`/configure`, `/delta`, `/pubkey`, ...);
+routes under `/x402/*` are the facilitator-specific ones documented below.
 
 Default base URL during development: `http://localhost:8080`.
 
-### B.1 `POST /verify`
+All `/x402/{challenge,verify,settle}` calls are **Guardian-authenticated**:
+the caller signs the request with a Falcon-512 cosigner key that appears
+in the account's `Auth::MidenFalconRpo::cosigner_commitments`. The merchant
+authenticates as its merchant account; the buyer authenticates as its
+buyer account. See OZ Guardian's [`spec/api.md`](../../guardian/spec/api.md)
+§ Miden Request Signing for the canonical signing format.
 
-Verifies a payment without producing any new on-chain effect.
+### B.1 `POST /x402/challenge`
 
-**Request body**
-
-```json
-{
-  "x402Version": 2,
-  "paymentPayload":      { /* MidenPaymentPayload, see A.2.4 */ },
-  "paymentRequirements": { /* MidenPaymentRequirements, the chosen accept */ }
-}
-```
-
-**Success response** — `200 OK`
-
-```json
-{
-  "isValid": true,
-  "payer": "0x857b06519e91e3a54538791bdbb0e2"
-}
-```
-
-**Failure response** — `400 Bad Request` (or `500` for internal errors)
-
-```json
-{
-  "isValid": false,
-  "invalidReason": "asset_mismatch",
-  "invalidReasonDetails": "on-chain note asset does not match requirements"
-}
-```
-
-The `invalidReason` field is one of the canonical x402 [`ErrorReason`]
-values; the merchant uses it to decide how to respond to the buyer.
-
-### B.2 `POST /settle`
-
-Same request body and verification logic as `/verify`. Returns
-`SettleResponse` directly — this is the value the merchant base64-encodes
-into the `Payment-Response` header.
-
-**Success response** — `200 OK`
-
-```json
-{
-  "success": true,
-  "payer": "0x857b06519e91e3a54538791bdbb0e2",
-  "transaction": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-  "network": "miden:testnet"
-}
-```
-
-**Failure response** — `400` / `500` with the same error body as `/verify`.
-
-Under settled-at-commit semantics `/settle` is idempotent and produces no
-new on-chain tx of its own: it just re-verifies and returns the buyer's
-create-note tx id.
-
-### B.2.7 Guardian endpoints (Phase B)
-
-The Guardian endpoints are mounted only when the facilitator is started
-with `MIDEN_X402_GUARDIAN_ENABLED=true`. When disabled (default), the
-endpoints below are absent from the router and the facilitator behaves
-byte-for-byte like Phase A.
-
-#### `POST /guardian/challenge`
+Issues a server-generated `serial_num`.
 
 **Request body**
 
 ```json
-{ "paymentRequirements": { /* MidenPaymentRequirements */ } }
+{
+  "paymentRequirements": { /* MidenPaymentRequirements without extra.serialNum */ }
+}
 ```
+
+**Auth**: signed by the merchant account.
 
 **Success response** — `200 OK`
 
@@ -371,49 +244,92 @@ byte-for-byte like Phase A.
 }
 ```
 
-Issues a single-use server-generated `serial_num`. The merchant inlines
-this value into `extra.serialNum` and `extra.guardianUrl` of the 402
-response.
+### B.2 `POST /x402/verify`
 
-#### `POST /guardian/verify`
+Verifies a signed-but-unproven payment without enqueueing it for
+settlement. Reserves the input + output nullifiers.
 
-Same request body as `/verify`. The payload's `noteType` must be
-`"guardianFast"`. Performs the offline Falcon verification and reserves
-the input nullifiers, but does NOT prove or submit — the reservation is
-held until `/guardian/settle` is called (success) or the TTL sweeper
-releases it (timeout).
+**Request body** (same shape as §B.3):
 
-Returns `VerifyResponse::Valid { payer }` on success.
+```json
+{
+  "x402Version": 2,
+  "paymentPayload":      { /* MidenPaymentPayload */ },
+  "paymentRequirements": { /* MidenPaymentRequirements */ }
+}
+```
 
-#### `POST /guardian/settle`
+**Auth**: signed by the buyer account.
 
-Same request body. Runs the same checks as `/guardian/verify`, then
-forwards the verified `TransactionInputs` to the configured remote prover
-(`MIDEN_X402_REMOTE_PROVER_URL`) and submits the resulting
-`ProvenTransaction` to the Miden node. On success the reservation is
-promoted to consumed; on any failure it is released. Returns
-`SettleResponse::Success { payer, transaction, network }` where
-`transaction` is the post-prove `ProvenTransaction.id()`.
+**Success response** — `200 OK`
 
-Returns `503 Service Unavailable` if `MIDEN_X402_REMOTE_PROVER_URL` is
-unset; `501 Not Implemented` if `MIDEN_X402_GUARDIAN_ENABLED=false`.
+```json
+{ "isValid": true, "payer": "0x857b06519e91e3a54538791bdbb0e2" }
+```
 
-### B.3 `GET /supported`
+**Failure response** — `400` / `409` / `412` / `503` (see §B.5):
+
+```json
+{
+  "isValid": false,
+  "invalidReason": "asset_mismatch",
+  "invalidReasonDetails": "..."
+}
+```
+
+### B.3 `POST /x402/settle`
+
+Same request body as `/x402/verify`. Runs the same checks, then enqueues
+the verified tx on the batch worker for prove + submit and returns a
+signed receipt.
+
+**Auth**: signed by the buyer account.
+
+**Success response** — `200 OK`
+
+```json
+{
+  "success": true,
+  "payer": "0x...",
+  "transaction": "0x<queued_id>",
+  "network": "miden:testnet",
+  "receiptSig": "<base64>",
+  "receiptPubkeyCommitment": "0x..."
+}
+```
+
+The response returns immediately — prove + submit happen asynchronously
+in the background batch worker. The merchant can deliver the resource as
+soon as it has the receipt; the facilitator's signature on the receipt is
+the trust anchor (DESIGN.md "same trust assumptions as Base").
+
+### B.4 `GET /x402/pubkey`
+
+Returns the facilitator's settle-receipt pubkey. No authentication
+required.
+
+```json
+{
+  "commitment": "0x<falcon pubkey commitment>",
+  "pubkeyB64": "<base64 of raw Falcon public key>"
+}
+```
+
+Merchants cache this once per facilitator operator and verify every
+`receiptSig` against it.
+
+### B.5 `GET /x402/supported`
 
 ```json
 {
   "kinds": [
-    {
-      "x402Version": 2,
-      "scheme": "exact",
-      "network": "miden:testnet"
-    }
+    { "x402Version": 2, "scheme": "miden-p2id-private", "network": "miden:testnet" }
   ],
-  "extensions": []
+  "extensions": ["miden-guardian-facilitator"]
 }
 ```
 
-### B.4 `GET /health`
+### B.6 `GET /x402/health`
 
 ```json
 { "status": "ok" }
@@ -423,49 +339,56 @@ unset; `501 Not Implemented` if `MIDEN_X402_GUARDIAN_ENABLED=false`.
 
 ## C. Verification rules (informative)
 
-The facilitator runs the following checks, fail-fast, in this order, through
-a single note-type-agnostic pipeline. The only step that branches on
-`noteType` is rule 5 — recipient and asset come from the on-chain note for
-`public` and from the off-chain `noteBlob` for `private`, bound to chain
-state by recomputing the `noteId`. See
-[`crate::verifier`](../crates/miden-x402-facilitator/src/verifier.rs) for the
-canonical implementation.
+The Guardian-facilitator runs the following checks in order on
+`POST /x402/{verify,settle}`. Each failure maps to a canonical x402
+`ErrorReason` and an HTTP status code. See
+[`crates/miden-x402-facilitator/src/verify.rs`](../crates/miden-x402-facilitator/src/verify.rs)
+for the canonical implementation.
 
-1. **Agreement check.** `paymentPayload.accepted` matches
-   `paymentRequirements` on `network`, `payTo`, `asset`, `amount`, and
-   `extra.noteType`. The `payload.payload` discriminator must match
-   `extra.noteType`.
-2. **Network.** `requirements.network.namespace == "miden"`.
-3. **Allowlist.** `requirements.asset` is on the facilitator's faucet
-   allowlist (env `MIDEN_X402_ALLOWED_FAUCETS`, default seeded to the
-   testnet token).
-4. **Note kind.** Both `"public"` and `"private"` are supported.
-5. **Resolve note.**
-   - *Public:* `get_notes_by_id` returns `FetchedNote::Public(Note, proof)`;
-     recipient, asset, sender, and block num are read directly from the
-     on-chain note.
-   - *Private:* base64-decode `noteBlob` → `NoteFile`. Accept only
-     `NoteDetails` / `NoteWithProof` variants (a bare `NoteId` is rejected).
-     Recompute the `noteId` and call `get_notes_by_id`; expect
-     `FetchedNote::Private(NoteHeader, proof)`. Recipient and asset come
-     from the off-chain `NoteDetails`; sender and block num come from the
-     on-chain header. The `noteId` equality is the cryptographic bind —
-     any tampering with the off-chain note changes the commitment and
-     misses on the lookup.
-6. **P2ID script root.** `note.recipient().script().root() == P2idNote::script_root()`.
-7. **Recipient.** Extracted via `P2idNoteStorage::try_from(note.recipient().storage().items())`,
-   compared to `requirements.payTo`.
-8. **Asset.** Exactly one fungible asset whose faucet equals
-   `requirements.asset` and amount equals `requirements.amount`.
-9. **Sender.** On-chain `metadata().sender() == paymentPayload.payload.sender`.
-10. **Nullifier.** Not yet in the consumed set. For private notes, the
-    nullifier is recomputed off-chain from the `NoteFile` (a function of
-    serial_num, script_root, storage_commitment, asset_commitment — no
-    consumer key needed) and checked via the same `check_nullifiers` RPC.
-11. **Freshness.** `currentBlockNum - note.blockNum <= MIDEN_X402_FRESHNESS_BLOCKS`.
+1. **Network.** `requirements.network` is in the Miden namespace and
+   matches the facilitator's configured network.
+2. **Asset/amount agreement.** `payload.asset == requirements.asset` and
+   `payload.amount == requirements.amount`.
+3. **Challenge consumption.** `payload.serialNum` is in the
+   facilitator's challenge store and not expired. The challenge is
+   consumed atomically (replays fail).
+4. **Wire decoding.** `txInputs`, `signature`, `signedSummary`, and
+   `expectedNoteBlob` deserialise as their canonical Miden types.
+5. **Summary ↔ tx_inputs binding.**
+   `signedSummary.input_notes.commitment() == txInputs.input_notes.commitment()`.
+6. **Summary ↔ output blob binding.** Recomputed `noteId` from
+   `expectedNoteBlob` appears in `signedSummary.output_notes`.
+7. **P2ID script root.** The note in `expectedNoteBlob` carries the
+   canonical P2ID script root.
+8. **Recipient + asset extraction.** Recipient and faucet+amount in
+   `expectedNoteBlob` match `requirements.payTo` / `requirements.asset` /
+   `requirements.amount`.
+9. **Sender consistency.** `payload.sender == txInputs.account().id()`.
+10. **Falcon signature.** `signature.public_key` commitment is in the
+    buyer's `Auth::MidenFalconRpo::cosigner_commitments`; the signature
+    verifies against `signedSummary.to_commitment()`.
+11. **Nullifier backstop.** None of the input/output nullifiers have
+    been observed on chain (`check_nullifiers` via the Miden node).
+12. **Mandate policy.** `MandatePolicy::evaluate(...)` returns `Ok`.
+    See [`docs/mandate.md`](./mandate.md).
+13. **Balance check.** Buyer's Guardian-persisted vault state shows ≥
+    `requirements.amount` of `requirements.asset`. Unrecognised state
+    shapes degrade to "allow" (the on-chain check at prove time is the
+    real enforcement).
+14. **Atomic reservation.** Input + output nullifiers reserved in the
+    facilitator's reservation store; concurrent attempts fail with
+    `409 Conflict`.
 
-Any violation maps to a canonical x402 [`ErrorReason`]; the HTTP status code
-is `400` for client-side failures and `500` for unexpected node failures.
+HTTP status codes:
+
+- `400 Bad Request` — input/blob/binding/signature failures.
+- `409 Conflict` — nullifier already reserved or already-consumed on
+  chain.
+- `412 Precondition Failed` — buyer balance insufficient.
+- `500 Internal Server Error` — facilitator-internal failures
+  (storage, receipt signer).
+- `503 Service Unavailable` — Miden node RPC failure, remote prover
+  unreachable, or mandate backend down.
 
 ---
 
@@ -473,14 +396,11 @@ is `400` for client-side failures and `500` for unexpected node failures.
 
 | Layer | Status |
 |---|---|
-| Wire types (`miden-x402-types`) | M1 — shipped |
-| Facilitator (`miden-x402-facilitator`) | M2 — shipped |
-| Header contract (this document + helpers) | M3 — shipped |
-| Live testnet smoke binary (`miden-x402-smoke-testnet`) | M4a — shipped |
-| Node SDK (merchant + agent) | M4b — shipped |
-| Python SDK (merchant) | M5 — shipped |
-| Quickstart README + scheme + deploy docs | M6 — shipped |
-| Private notes (`noteType: "private"`) | M7 — shipped |
-| Guardian verify-before-prove (`settlement: "guardian-fast"`) | M8 — shipped (verify path; settle path requires WASM SDK extensions to drive the buyer side end-to-end) |
-
-[`ErrorReason`]: https://docs.rs/x402-types/latest/x402_types/proto/enum.ErrorReason.html
+| Wire types (`miden-x402-types`) | shipped |
+| Guardian-facilitator binary (`guardian-facilitator`) | shipped (server-side) |
+| Node merchant SDK (Express + Hono) | shipped |
+| Node agent SDK | stub (blocked on WASM SDK extensions — see [`docs/UPSTREAM_WISHLIST.md`](./UPSTREAM_WISHLIST.md)) |
+| Python merchant SDK (FastAPI + Flask) | shipped |
+| Mandate policy hook | shipped (default `AllowAll`) |
+| Batch settle worker | shipped |
+| Inclusion-bridge (reservation → consumed on canonical block) | partial (see UPSTREAM_WISHLIST.md) |

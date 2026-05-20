@@ -1,57 +1,90 @@
 # miden-x402
 
-x402 v2 payments for the Miden network. This repo ships:
+x402 v2 payments for the Miden network, realised as a module bolted onto
+the OpenZeppelin [Guardian](https://github.com/OpenZeppelin/guardian).
+One operator runs one Guardian process that handles both the multisig
+private-state lifecycle (Guardian's existing job) and the x402 facilitator
+lifecycle (verify-before-prove + batched settlement) — a single trust
+anchor for buyers, merchants, and AI agents.
 
-- **`miden-x402-facilitator`** — Rust facilitator service that verifies
-  Miden P2ID payments against live testnet. `POST /verify`, `POST /settle`,
-  `GET /supported`, `GET /health`.
-- **`@miden-x402/merchant`** and **`@miden-x402/agent`** — Node.js SDK.
-  Express + Hono merchant middleware; agent client wrapping `fetch` with
-  P2ID payment via `@miden-sdk/miden-sdk` (WASM).
-- **`miden-x402`** (Python) — FastAPI + Flask merchant middleware. No
-  Python agent (no official Miden Python client SDK); use the Node agent
-  for E2E.
+Design write-up: [`ideas/DESIGN.md`](./ideas/DESIGN.md). Wire contract:
+[`docs/protocol.md`](./docs/protocol.md). What it would take to integrate
+this upstream into OZ Guardian itself:
+[`docs/UPSTREAM_WISHLIST.md`](./docs/UPSTREAM_WISHLIST.md).
 
-Wire format is the [x402 v2 protocol](https://x402.org) over three
-HTTP headers, base64-of-JSON encoded:
+## What ships
 
-| Header | Direction | Body |
-|---|---|---|
-| `Payment-Required` | merchant → buyer (402) | `MidenPaymentRequired` |
-| `Payment-Signature` | buyer → merchant (retry) | `MidenPaymentPayload` |
-| `Payment-Response` | merchant → buyer (200) | `SettleResponse` |
+- **`miden-x402-facilitator`** — Rust binary `guardian-facilitator` that
+  runs a Guardian server with the `/x402/*` routes mounted on the same
+  port. Verify-before-prove, async batch settlement via a remote prover,
+  pluggable mandate policy, persistent challenge / reservation / batch
+  storage.
+- **`@miden-x402/merchant` + `@miden-x402/types`** — Node merchant SDK
+  with Express + Hono adapters.
+- **`miden-x402` (Python)** — FastAPI + Flask merchant middleware.
+- **`@miden-x402/agent`** — Node agent client stub. End-to-end agent
+  payments from JS need `@miden-sdk/miden-sdk` extensions tracked in
+  [`docs/UPSTREAM_WISHLIST.md`](./docs/UPSTREAM_WISHLIST.md); use the
+  `miden-multisig-client` Rust crate from the OZ Guardian repo today.
 
-The settled-at-commit model: a P2ID note in a committed Miden block is
-the settlement event. The facilitator is a read-only verifier — it never
-custodies keys.
+## Wire format at a glance
 
-The full wire contract is [`docs/protocol.md`](./docs/protocol.md). The
-scheme is documented in [`docs/scheme_exact_miden.md`](./docs/scheme_exact_miden.md).
-Deployment notes live in [`docs/deploy.md`](./docs/deploy.md).
+The 402 response carries one entry in `accepts[]`:
+
+```json
+{
+  "scheme": "miden-p2id-private",
+  "network": "miden:testnet",
+  "amount": "1000",
+  "asset": "0x0a7d175ed63ec5200fb2ced86f6aa5",
+  "payTo": "0x103f8a1ad4b983104aec0412ab0b0d",
+  "maxTimeoutSeconds": 120,
+  "extra": {
+    "noteTag": "weather.api",
+    "serialNum": "0x<server-issued 32-byte word>"
+  }
+}
+```
+
+The `Payment-Signature` payload carries a base64-encoded
+`TransactionInputs` + Falcon signature + `TransactionSummary` +
+`NoteFile::NoteDetails` blob — i.e., a signed-but-not-yet-proven Miden
+transaction. The Guardian-facilitator verifies the signature against the
+buyer's cosigner commitments, reserves the nullifiers, and replies with a
+signed receipt; the actual prove + submit happens in a background batch
+worker.
+
+Full protocol: [`docs/protocol.md`](./docs/protocol.md).
 
 ## Quickstart
 
-### 1. Run the facilitator (Rust)
+### 1. Run the Guardian-facilitator
 
-```
-cargo run -p miden-x402-facilitator --bin miden-x402-facilitator
+```bash
+export MIDEN_X402_REMOTE_PROVER_URL=https://prover.testnet.miden.io
+export MIDEN_X402_NETWORK=miden:testnet
+export MIDEN_X402_STORAGE_ROOT=/var/x402/state
+cargo run --release -p miden-x402-facilitator --bin guardian-facilitator
 ```
 
-By default it listens on `0.0.0.0:8080` and talks to
-`https://rpc.testnet.miden.io`. See [`docs/deploy.md`](./docs/deploy.md)
-for env vars.
+Listens on `0.0.0.0:8080` by default; Guardian routes mount under `/`
+and x402 routes under `/x402/*`. See [`docs/deploy.md`](./docs/deploy.md)
+for the full env-var reference.
 
 Sanity checks:
 
-```
-$ curl -s http://localhost:8080/health
+```bash
+$ curl -s http://localhost:8080/x402/health
 {"status":"ok"}
 
-$ curl -s http://localhost:8080/supported
-{"kinds":[{"x402Version":2,"scheme":"exact","network":"miden:testnet"}],"extensions":[]}
+$ curl -s http://localhost:8080/x402/supported
+{"kinds":[{"x402Version":2,"scheme":"miden-p2id-private","network":"miden:testnet"}],"extensions":["miden-guardian-facilitator"]}
+
+$ curl -s http://localhost:8080/x402/pubkey
+{"commitment":"0x...","pubkeyB64":"..."}
 ```
 
-### 2. Add a paywall to your server
+### 2. Gate a route with the merchant SDK
 
 **Node (Express):**
 
@@ -64,12 +97,12 @@ app.get(
   '/weather',
   paywall({
     facilitatorUrl: 'http://localhost:8080',
+    merchantAuth: myGuardianAuth, // signs x-pubkey/x-signature/x-timestamp
     price: {
       amount: '1000',
       asset: '0x0a7d175ed63ec5200fb2ced86f6aa5',
       payTo: '0x...your-merchant-account-id...',
-      tokenSymbol: 'USDC',
-      decimals: 6,
+      noteTag: 'weather.api',
     },
   }),
   (_req, res) => res.json({ temperature: 21.5, city: 'Istanbul' }),
@@ -89,56 +122,45 @@ price = PriceTag(
     amount="1000",
     asset="0x0a7d175ed63ec5200fb2ced86f6aa5",
     pay_to="0x...your-merchant-account-id...",
-    token_symbol="USDC",
-    decimals=6,
+    note_tag="weather.api",
 )
-config = PaywallConfig(facilitator_url="http://localhost:8080")
+config = PaywallConfig(
+    facilitator_url="http://localhost:8080",
+    sign_request=my_guardian_signer,
+)
 
 @app.get("/weather", dependencies=[Depends(paywall(price=price, config=config))])
 def weather():
     return {"temperature": 21.5, "city": "Istanbul"}
 ```
 
-Hono + Flask variants in [`sdks/node`](./sdks/node) and
-[`sdks/python`](./sdks/python).
+The merchant must authenticate `POST /x402/challenge` and `POST /x402/settle`
+as its own Guardian-registered account — see
+[`docs/protocol.md`](./docs/protocol.md) §B.
 
 ### 3. Pay a 402 from an agent
 
-```ts
-import { withMidenX402, createWasmSdkPayer } from '@miden-x402/agent';
-
-const payer = createWasmSdkPayer({
-  buyerAccountId: '0x...your-funded-buyer...',
-  storePath: './buyer-store',
-});
-
-const fetchPaid = withMidenX402(fetch, { payer });
-const r = await fetchPaid('http://localhost:3000/weather');
-console.log(await r.json());
-```
-
-`withMidenX402` is a drop-in `fetch` wrapper: on `402`, it pays the P2ID
-note, retries, and returns the resource.
-
-For a no-Miden-network smoke check of the full HTTP wiring, see the
-**Mock-mode demo** in [`sdks/node/README.md`](./sdks/node/README.md).
-
-For a live-testnet smoke against a real on-chain P2ID note, see
-[`docs/smoke-testnet.md`](./docs/smoke-testnet.md).
+End-to-end agent flow from JS is blocked on WASM SDK extensions
+([UPSTREAM_WISHLIST.md](./docs/UPSTREAM_WISHLIST.md)). For Rust agents,
+use [`miden-multisig-client`](https://github.com/OpenZeppelin/guardian/tree/main/crates/miden-multisig-client)
+from the OZ Guardian repo today.
 
 ## Status
 
-| Component | Milestone | Status |
-|---|---|---|
-| Wire types (`miden-x402-types`) | M1 | shipped |
-| Facilitator (`miden-x402-facilitator`) | M2 | shipped |
-| Header contract + `docs/protocol.md` | M3 | shipped |
-| Live testnet smoke binary | M4a | shipped |
-| Node SDK (merchant + agent + demos) | M4b | shipped |
-| Python SDK (merchant + demos) | M5 | shipped |
-| Quickstart + deploy + scheme docs | M6 | shipped |
-| Private P2ID notes (unified verifier; `noteType: "private"`) | M7 | shipped |
-| Guardian verify-before-prove (`settlement: "guardian-fast"`) | M8 | shipped (server-side; full E2E requires WASM SDK extensions) |
+| Component | Status |
+|---|---|
+| Wire types (`miden-x402-types`) | shipped |
+| Guardian-facilitator binary (`guardian-facilitator`) | shipped |
+| Verify-before-prove pipeline | shipped |
+| Async batch settle worker | shipped |
+| Mandate policy hook (`AllowAll` default) | shipped |
+| Falcon-signed settle receipts | shipped (facilitator-owned key; see UPSTREAM_WISHLIST.md) |
+| Node merchant SDK (Express + Hono) | shipped |
+| Python merchant SDK (FastAPI + Flask) | shipped |
+| Node agent SDK | stub (blocked on WASM SDK extensions) |
+| `check_nullifiers` backstop | wired in lib, no-op in binary (see UPSTREAM_WISHLIST.md) |
+| Inclusion-bridge (reservation → consumed on canonical) | see UPSTREAM_WISHLIST.md |
+| Postgres-backed x402 repos | future work (trait ready) |
 
 ## License
 
