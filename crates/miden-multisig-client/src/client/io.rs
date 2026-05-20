@@ -1,0 +1,148 @@
+//! Export/import operations for MultisigClient.
+//!
+//! This module handles exporting proposals to files/strings and
+//! importing them back for offline sharing workflows.
+
+use guardian_client::delta_status::Status;
+use guardian_shared::SignatureScheme;
+
+use super::MultisigClient;
+use crate::error::{MultisigError, Result};
+use crate::export::{ExportedProposal, ExportedSignature};
+
+impl MultisigClient {
+    /// Exports a proposal to a file for offline sharing.
+    ///
+    /// This fetches the proposal from GUARDIAN, including all collected signatures,
+    /// and writes it to the specified file path as JSON.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// client.export_proposal(&proposal_id, "/tmp/proposal.json").await?;
+    /// ```
+    pub async fn export_proposal(
+        &mut self,
+        proposal_id: &str,
+        path: &std::path::Path,
+    ) -> Result<()> {
+        let exported = self.export_proposal_to_exported(proposal_id).await?;
+        let json = exported.to_json()?;
+        std::fs::write(path, json)
+            .map_err(|e| MultisigError::InvalidConfig(format!("failed to write file: {}", e)))?;
+        Ok(())
+    }
+
+    /// Exports a proposal to a JSON string for programmatic use.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let json = client.export_proposal_to_string(&proposal_id).await?;
+    /// println!("{}", json);
+    /// ```
+    pub async fn export_proposal_to_string(&mut self, proposal_id: &str) -> Result<String> {
+        let exported = self.export_proposal_to_exported(proposal_id).await?;
+        exported.to_json()
+    }
+
+    /// Internal helper to create an ExportedProposal from GUARDIAN data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The proposal is not found in GUARDIAN
+    /// - The raw delta cannot be found in GUARDIAN response
+    /// - The delta has no pending status with signature data
+    async fn export_proposal_to_exported(&mut self, proposal_id: &str) -> Result<ExportedProposal> {
+        let account = self.require_account()?.clone();
+        let account_id = account.id();
+        let mut guardian_client = self.create_authenticated_guardian_client().await?;
+        let response = guardian_client
+            .get_delta_proposal(&account_id, proposal_id)
+            .await
+            .map_err(|e| MultisigError::GuardianServer(format!("failed to get proposal: {}", e)))?;
+        let raw_proposal = response
+            .proposal
+            .as_ref()
+            .ok_or_else(|| MultisigError::ProposalNotFound(proposal_id.to_string()))?;
+        Self::ensure_proposal_account_id(&raw_proposal.account_id, &account_id)?;
+        let proposal = crate::proposal::Proposal::from(raw_proposal)?;
+        self.verify_proposal_summary_binding(&proposal).await?;
+
+        // Extract signatures - fail if status structure is missing
+        let status = raw_proposal.status.as_ref().ok_or_else(|| {
+            MultisigError::GuardianServer(format!("proposal {} has no status field", proposal_id))
+        })?;
+
+        let status_oneof = status.status.as_ref().ok_or_else(|| {
+            MultisigError::GuardianServer(format!("proposal {} has empty status", proposal_id))
+        })?;
+
+        let pending = match status_oneof {
+            Status::Pending(p) => p,
+            _ => {
+                return Err(MultisigError::GuardianServer(format!(
+                    "proposal {} is not in pending state",
+                    proposal_id
+                )));
+            }
+        };
+
+        let mut signatures = Vec::new();
+        for cosigner_sig in pending.cosigner_sigs.iter() {
+            if let Some(ref sig) = cosigner_sig.signature {
+                let scheme = if sig.scheme.eq_ignore_ascii_case("ecdsa") {
+                    SignatureScheme::Ecdsa
+                } else {
+                    SignatureScheme::Falcon
+                };
+                signatures.push(ExportedSignature {
+                    signer_commitment: cosigner_sig.signer_id.clone(),
+                    signature: sig.signature.clone(),
+                    scheme,
+                    public_key_hex: sig.public_key.clone(),
+                });
+            }
+        }
+
+        let exported =
+            ExportedProposal::from_proposal(&proposal, account_id)?.with_signatures(signatures);
+
+        Ok(exported)
+    }
+
+    /// Imports a proposal from a file.
+    ///
+    /// The proposal can then be signed with `sign_imported_proposal`
+    /// or executed with `execute_imported_proposal`.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let proposal = client.import_proposal("/tmp/proposal.json").await?;
+    /// println!("Imported proposal: {}", proposal.id);
+    /// ```
+    pub async fn import_proposal(&mut self, path: &std::path::Path) -> Result<ExportedProposal> {
+        let json = std::fs::read_to_string(path)
+            .map_err(|e| MultisigError::InvalidConfig(format!("failed to read file: {}", e)))?;
+        self.import_proposal_from_string(&json).await
+    }
+
+    /// Imports a proposal from a JSON string.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let proposal = client.import_proposal_from_string(&json).await?;
+    /// ```
+    pub async fn import_proposal_from_string(&mut self, json: &str) -> Result<ExportedProposal> {
+        let exported = ExportedProposal::from_json(json)?;
+        exported.validate(self.account.as_ref().map(|account| account.id()))?;
+
+        let proposal = exported.to_proposal()?;
+        self.verify_proposal_summary_binding(&proposal).await?;
+
+        Ok(exported)
+    }
+}

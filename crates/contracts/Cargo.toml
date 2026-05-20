@@ -1,0 +1,30 @@
+[package]
+name = "miden-confidential-contracts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Miden multisig smart contract accounts"
+default-run = "miden-confidential-contracts"
+
+[dependencies]
+miden-standards = { version = "=0.14.5" }
+miden-protocol = { version = "=0.14.5" }
+miden-tx = { version = "=0.14.5" }
+miden-testing = { version = "=0.14.5" }
+
+anyhow = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros", "fs"] }
+guardian-shared = { version = "=0.14.6", path = "../shared" }
+
+[dev-dependencies]
+miden-client = { version = "=0.14.5", features = ["testing", "tonic"] }
+
+rand = { workspace = true }
+rand_chacha = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["raw_value"] }
+assert_matches = { workspace = true }

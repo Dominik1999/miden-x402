@@ -1,0 +1,37 @@
+version: "3.9"
+
+services:
+  facilitator:
+    build:
+      context: .
+      dockerfile: docker/facilitator.Dockerfile
+    environment:
+      MIDEN_RPC_ENDPOINT: ${MIDEN_RPC_ENDPOINT:-https://rpc.testnet.miden.io}
+      FACILITATOR_HTTP_PORT: 7002
+      FACILITATOR_DATA_DIR: /var/x402/data
+      FACILITATOR_KEYSTORE_PATH: /var/x402/keystore
+      BATCH_INTERVAL_MS: 1000
+      BATCH_MAX_SIZE: 50
+      RUST_LOG: info
+    volumes:
+      - facilitator-data:/var/x402/data
+      - facilitator-keystore:/var/x402/keystore
+    ports:
+      - "7002:7002"
+
+  merchant:
+    build:
+      context: .
+      dockerfile: docker/merchant.Dockerfile
+    environment:
+      FACILITATOR_URL: http://facilitator:7002
+      MERCHANT_HTTP_PORT: 7001
+      RUST_LOG: info
+    depends_on:
+      - facilitator
+    ports:
+      - "7001:7001"
+
+volumes:
+  facilitator-data:
+  facilitator-keystore:

@@ -1,0 +1,63 @@
+[package]
+name = "x402-facilitator-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "x402 payment facilitator on top of OpenZeppelin Guardian for Miden"
+
+[lib]
+name = "x402_facilitator"
+path = "src/lib.rs"
+
+[[bin]]
+name = "x402-facilitator-server"
+path = "src/main.rs"
+
+[dependencies]
+# Vendored guardian
+guardian-server = { path = "../server" }
+guardian-shared = { path = "../shared" }
+miden-rpc-client = { path = "../miden-rpc-client" }
+miden-keystore = { path = "../miden-keystore" }
+
+# HTTP & async
+axum = "0.8.6"
+tokio = { workspace = true, features = ["full"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors"] }
+
+# Serde
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+
+# Concurrency
+dashmap = "6.1"
+
+# Crypto RNG (must match the version miden-keystore expects)
+rand = { workspace = true }
+rand_chacha = { workspace = true }
+
+# Logging / errors
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Miden
+miden-protocol = { workspace = true }
+miden-client = { workspace = true, features = ["tonic"] }
+miden-client-sqlite-store = { workspace = true }
+miden-tx = { workspace = true }
+miden-standards = { workspace = true }
+
+# Env loading
+dotenvy = "0.15"
+
+[dev-dependencies]
+tempfile = { workspace = true }

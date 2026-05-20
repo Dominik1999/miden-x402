@@ -1,0 +1,515 @@
+//! Payload types for multisig transaction proposals.
+
+use guardian_shared::{DeltaSignature, ProposalSignature, ToJson};
+use miden_protocol::transaction::TransactionSummary;
+use serde::{Deserialize, Serialize};
+
+use crate::keystore::{KeyManager, proposal_public_key_hex};
+use crate::procedures::ProcedureName;
+
+/// Metadata for multisig transaction proposals.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ProposalMetadataPayload {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub proposal_type: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_threshold: Option<u64>,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub signer_commitments: Vec<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub salt: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recipient_id: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub faucet_id: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amount: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required_signatures: Option<u64>,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub note_ids: Vec<String>,
+
+    /// `consume_notes` metadata version (issue #229). Absent => v1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consume_notes_metadata_version: Option<u32>,
+
+    /// v2 embedded notes (base64), index-aligned with `note_ids`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub consume_notes_notes: Vec<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_guardian_pubkey: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_guardian_endpoint: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_procedure: Option<String>,
+}
+
+/// Complete payload for a multisig transaction proposal.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ProposalPayload {
+    pub tx_summary: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub signatures: Vec<DeltaSignature>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<ProposalMetadataPayload>,
+}
+
+impl ProposalPayload {
+    pub fn new(tx_summary: &TransactionSummary) -> Self {
+        Self {
+            tx_summary: tx_summary.to_json(),
+            signatures: Vec::new(),
+            metadata: None,
+        }
+    }
+
+    /// Adds the proposer's signature.
+    pub fn with_signature(
+        mut self,
+        key_manager: &dyn KeyManager,
+        message: miden_protocol::Word,
+    ) -> Self {
+        let signature_hex = key_manager.sign_word_hex(message);
+        self.signatures.push(DeltaSignature {
+            signer_id: key_manager.commitment_hex(),
+            signature: ProposalSignature::from_scheme(
+                key_manager.scheme(),
+                signature_hex,
+                proposal_public_key_hex(key_manager),
+            ),
+        });
+        self
+    }
+
+    /// Sets the metadata for adding a signer.
+    pub fn with_add_signer_metadata(
+        mut self,
+        new_threshold: u64,
+        signer_commitments: Vec<String>,
+        salt: String,
+    ) -> Self {
+        self.metadata = Some(ProposalMetadataPayload {
+            proposal_type: "add_signer".to_string(),
+            target_threshold: Some(new_threshold),
+            signer_commitments,
+            salt: Some(salt),
+            ..Default::default()
+        });
+        self
+    }
+
+    /// Sets the metadata for removing a signer.
+    pub fn with_remove_signer_metadata(
+        mut self,
+        new_threshold: u64,
+        signer_commitments: Vec<String>,
+        salt: String,
+    ) -> Self {
+        self.metadata = Some(ProposalMetadataPayload {
+            proposal_type: "remove_signer".to_string(),
+            target_threshold: Some(new_threshold),
+            signer_commitments,
+            salt: Some(salt),
+            ..Default::default()
+        });
+        self
+    }
+
+    /// Sets the metadata for changing threshold.
+    pub fn with_threshold_metadata(
+        mut self,
+        new_threshold: u64,
+        signer_commitments: Vec<String>,
+        salt: String,
+    ) -> Self {
+        self.metadata = Some(ProposalMetadataPayload {
+            proposal_type: "change_threshold".to_string(),
+            target_threshold: Some(new_threshold),
+            signer_commitments,
+            salt: Some(salt),
+            ..Default::default()
+        });
+        self
+    }
+
+    /// Sets the metadata for P2ID payment transfers.
+    pub fn with_payment_metadata(
+        mut self,
+        recipient_id: String,
+        faucet_id: String,
+        amount: u64,
+        salt: String,
+    ) -> Self {
+        self.metadata = Some(ProposalMetadataPayload {
+            proposal_type: "p2id".to_string(),
+            recipient_id: Some(recipient_id),
+            faucet_id: Some(faucet_id),
+            amount: Some(amount.to_string()),
+            salt: Some(salt),
+            ..Default::default()
+        });
+        self
+    }
+
+    /// Legacy (v1) note consumption metadata. Prefer
+    /// `with_note_consumption_metadata_v2` for new proposals (issue #229).
+    pub fn with_note_consumption_metadata(mut self, note_ids: &[String], salt: String) -> Self {
+        self.metadata = Some(ProposalMetadataPayload {
+            proposal_type: "consume_notes".to_string(),
+            note_ids: note_ids.to_vec(),
+            salt: Some(salt),
+            ..Default::default()
+        });
+        self
+    }
+
+    /// v2 (self-contained) note consumption metadata. `notes_base64[i]`
+    /// MUST correspond to `note_ids[i]`; the binding is reasserted at
+    /// verify time (FR-007). Takes both vecs by value to skip a clone.
+    pub fn with_note_consumption_metadata_v2(
+        mut self,
+        note_ids: Vec<String>,
+        notes_base64: Vec<String>,
+        salt: String,
+    ) -> Self {
+        self.metadata = Some(ProposalMetadataPayload {
+            proposal_type: "consume_notes".to_string(),
+            note_ids,
+            consume_notes_metadata_version: Some(2),
+            consume_notes_notes: notes_base64,
+            salt: Some(salt),
+            ..Default::default()
+        });
+        self
+    }
+
+    /// Sets the metadata for GUARDIAN update transactions.
+    pub fn with_guardian_update_metadata(
+        mut self,
+        new_guardian_pubkey: String,
+        new_guardian_endpoint: String,
+        salt: String,
+    ) -> Self {
+        self.metadata = Some(ProposalMetadataPayload {
+            proposal_type: "switch_guardian".to_string(),
+            new_guardian_pubkey: Some(new_guardian_pubkey),
+            new_guardian_endpoint: Some(new_guardian_endpoint),
+            salt: Some(salt),
+            ..Default::default()
+        });
+        self
+    }
+
+    /// Sets the metadata for procedure-threshold override updates.
+    pub fn with_procedure_threshold_metadata(
+        mut self,
+        procedure: ProcedureName,
+        new_threshold: u64,
+        salt: String,
+    ) -> Self {
+        self.metadata = Some(ProposalMetadataPayload {
+            proposal_type: "update_procedure_threshold".to_string(),
+            target_threshold: Some(new_threshold),
+            target_procedure: Some(procedure.to_string()),
+            salt: Some(salt),
+            ..Default::default()
+        });
+        self
+    }
+
+    pub fn with_required_signatures(mut self, required_signatures: usize) -> Self {
+        let metadata = self
+            .metadata
+            .get_or_insert_with(ProposalMetadataPayload::default);
+        metadata.required_signatures = Some(required_signatures as u64);
+        self
+    }
+
+    /// Converts to JSON value for sending to GUARDIAN.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::to_value(self).expect("ProposalPayload should always serialize")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proposal_payload_serialization_includes_all_fields() {
+        let payload = ProposalPayload {
+            tx_summary: serde_json::json!({"data": "test"}),
+            signatures: vec![DeltaSignature {
+                signer_id: "0xabc".to_string(),
+                signature: ProposalSignature::Falcon {
+                    signature: "0x123".to_string(),
+                },
+            }],
+            metadata: Some(ProposalMetadataPayload {
+                proposal_type: "add_signer".to_string(),
+                target_threshold: Some(2),
+                signer_commitments: vec!["0xabc".to_string(), "0xdef".to_string()],
+                salt: Some("0x456".to_string()),
+                ..Default::default()
+            }),
+        };
+
+        let json = payload.to_json();
+
+        assert!(json.get("tx_summary").is_some());
+        assert!(json.get("signatures").is_some());
+        assert!(json.get("metadata").is_some());
+
+        let metadata = json.get("metadata").unwrap();
+        assert_eq!(metadata.get("target_threshold").unwrap().as_u64(), Some(2));
+        assert_eq!(
+            metadata.get("proposal_type").unwrap().as_str(),
+            Some("add_signer")
+        );
+    }
+
+    #[test]
+    fn with_add_signer_metadata_sets_fields() {
+        let payload = ProposalPayload {
+            tx_summary: serde_json::json!({}),
+            signatures: vec![],
+            metadata: None,
+        }
+        .with_add_signer_metadata(
+            3,
+            vec!["0xabc".to_string(), "0xdef".to_string()],
+            "0xsalt".to_string(),
+        );
+
+        let meta = payload.metadata.unwrap();
+        assert_eq!(meta.proposal_type, "add_signer");
+        assert_eq!(meta.target_threshold, Some(3));
+        assert_eq!(meta.signer_commitments.len(), 2);
+        assert_eq!(meta.salt, Some("0xsalt".to_string()));
+    }
+
+    #[test]
+    fn with_remove_signer_metadata_sets_fields() {
+        let payload = ProposalPayload {
+            tx_summary: serde_json::json!({}),
+            signatures: vec![],
+            metadata: None,
+        }
+        .with_remove_signer_metadata(2, vec!["0xabc".to_string()], "0xsalt".to_string());
+
+        let meta = payload.metadata.unwrap();
+        assert_eq!(meta.proposal_type, "remove_signer");
+        assert_eq!(meta.target_threshold, Some(2));
+    }
+
+    #[test]
+    fn with_payment_metadata_sets_fields() {
+        let payload = ProposalPayload {
+            tx_summary: serde_json::json!({}),
+            signatures: vec![],
+            metadata: None,
+        }
+        .with_payment_metadata(
+            "0xrecipient".to_string(),
+            "0xfaucet".to_string(),
+            1000,
+            "0xsalt".to_string(),
+        );
+
+        let meta = payload.metadata.unwrap();
+        assert_eq!(meta.proposal_type, "p2id");
+        assert_eq!(meta.recipient_id, Some("0xrecipient".to_string()));
+        assert_eq!(meta.faucet_id, Some("0xfaucet".to_string()));
+        assert_eq!(meta.amount, Some("1000".to_string()));
+        assert_eq!(meta.salt, Some("0xsalt".to_string()));
+    }
+
+    #[test]
+    fn with_note_consumption_metadata_sets_fields() {
+        let note_ids = vec!["0xnote1".to_string(), "0xnote2".to_string()];
+        let payload = ProposalPayload {
+            tx_summary: serde_json::json!({}),
+            signatures: vec![],
+            metadata: None,
+        }
+        .with_note_consumption_metadata(&note_ids, "0xsalt".to_string());
+
+        let meta = payload.metadata.unwrap();
+        assert_eq!(meta.proposal_type, "consume_notes");
+        assert_eq!(meta.note_ids.len(), 2);
+        assert_eq!(meta.note_ids[0], "0xnote1");
+        assert_eq!(meta.salt, Some("0xsalt".to_string()));
+    }
+
+    #[test]
+    fn with_guardian_update_metadata_sets_fields() {
+        let payload = ProposalPayload {
+            tx_summary: serde_json::json!({}),
+            signatures: vec![],
+            metadata: None,
+        }
+        .with_guardian_update_metadata(
+            "0xpubkey".to_string(),
+            "http://new-guardian:50051".to_string(),
+            "0xsalt".to_string(),
+        );
+
+        let meta = payload.metadata.unwrap();
+        assert_eq!(meta.proposal_type, "switch_guardian");
+        assert_eq!(meta.new_guardian_pubkey, Some("0xpubkey".to_string()));
+        assert_eq!(
+            meta.new_guardian_endpoint,
+            Some("http://new-guardian:50051".to_string())
+        );
+        assert_eq!(meta.salt, Some("0xsalt".to_string()));
+    }
+
+    #[test]
+    fn to_json_omits_empty_signatures() {
+        let payload = ProposalPayload {
+            tx_summary: serde_json::json!({}),
+            signatures: vec![],
+            metadata: None,
+        };
+
+        let json = payload.to_json();
+        assert!(json.get("signatures").is_none());
+    }
+
+    #[test]
+    fn to_json_omits_none_metadata() {
+        let payload = ProposalPayload {
+            tx_summary: serde_json::json!({}),
+            signatures: vec![],
+            metadata: None,
+        };
+
+        let json = payload.to_json();
+        assert!(json.get("metadata").is_none());
+    }
+
+    #[test]
+    fn metadata_serialization_omits_empty_fields() {
+        let meta = ProposalMetadataPayload {
+            proposal_type: "add_signer".to_string(),
+            target_threshold: Some(2),
+            ..Default::default()
+        };
+
+        let json = serde_json::to_value(&meta).unwrap();
+        assert!(json.get("target_threshold").is_some());
+        assert!(json.get("salt").is_none());
+        assert!(json.get("recipient_id").is_none());
+    }
+
+    #[test]
+    fn metadata_deserialization_handles_missing_fields() {
+        let json = r#"{"proposal_type": "add_signer", "target_threshold": 2}"#;
+        let meta: ProposalMetadataPayload = serde_json::from_str(json).unwrap();
+
+        assert_eq!(meta.proposal_type, "add_signer");
+        assert_eq!(meta.target_threshold, Some(2));
+        assert!(meta.signer_commitments.is_empty());
+        assert!(meta.salt.is_none());
+    }
+
+    // ---------- consume_notes metadata v1/v2 round-trip (issue #229) ----------
+
+    /// v1 (legacy) consume_notes payload must round-trip without
+    /// silently introducing a `consume_notes_metadata_version` field or
+    /// a `consume_notes_notes` array on the wire — so the v1 wire shape
+    /// remains byte-identical to the pre-feature shape (FR-003).
+    #[test]
+    fn consume_notes_v1_payload_omits_v2_fields_on_wire() {
+        let meta = ProposalMetadataPayload {
+            proposal_type: "consume_notes".to_string(),
+            note_ids: vec!["0xabc".to_string()],
+            salt: Some("0xsalt".to_string()),
+            ..Default::default()
+        };
+
+        let json = serde_json::to_value(&meta).unwrap();
+        assert!(json.get("consume_notes_metadata_version").is_none());
+        assert!(json.get("consume_notes_notes").is_none());
+
+        let parsed: ProposalMetadataPayload = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.proposal_type, "consume_notes");
+        assert_eq!(parsed.note_ids, vec!["0xabc".to_string()]);
+        assert!(parsed.consume_notes_metadata_version.is_none());
+        assert!(parsed.consume_notes_notes.is_empty());
+    }
+
+    /// v2 consume_notes payload round-trips with the discriminator and
+    /// embedded notes preserved (FR-001 / FR-002 wire support).
+    #[test]
+    fn consume_notes_v2_payload_round_trips() {
+        let meta = ProposalMetadataPayload {
+            proposal_type: "consume_notes".to_string(),
+            note_ids: vec!["0xabc".to_string(), "0xdef".to_string()],
+            consume_notes_metadata_version: Some(2),
+            consume_notes_notes: vec![
+                "YmFzZTY0Tm90ZTE=".to_string(),
+                "YmFzZTY0Tm90ZTI=".to_string(),
+            ],
+            salt: Some("0xsalt".to_string()),
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&meta).unwrap();
+        let parsed: ProposalMetadataPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.consume_notes_metadata_version, Some(2));
+        assert_eq!(parsed.consume_notes_notes.len(), 2);
+        assert_eq!(parsed.note_ids, meta.note_ids);
+        assert_eq!(parsed.consume_notes_notes, meta.consume_notes_notes);
+    }
+
+    /// An unrecognized future metadata version deserializes successfully
+    /// at the serde layer. Rejection happens at dispatch time per FR-009,
+    /// not at parse time — so the parser stays forward-compatible.
+    #[test]
+    fn consume_notes_unknown_version_parses_at_serde_layer() {
+        let json = r#"{"proposal_type":"consume_notes","note_ids":["0xabc"],"consume_notes_metadata_version":99}"#;
+        let meta: ProposalMetadataPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(meta.consume_notes_metadata_version, Some(99));
+    }
+
+    /// `with_note_consumption_metadata_v2` is the creation-path builder
+    /// that emits a v2-shape `consume_notes` proposal: discriminator
+    /// `Some(2)`, embedded `notes` populated, and indexes aligned with
+    /// the declared `note_ids` (binding asserted at verification time).
+    #[test]
+    fn with_note_consumption_metadata_v2_emits_v2_shape() {
+        let payload = ProposalPayload {
+            tx_summary: serde_json::json!({}),
+            signatures: vec![],
+            metadata: None,
+        }
+        .with_note_consumption_metadata_v2(
+            vec!["0xabc".to_string()],
+            vec!["YmFzZTY0Tm90ZQ==".to_string()],
+            "0xsalt".to_string(),
+        );
+
+        let meta = payload.metadata.expect("metadata");
+        assert_eq!(meta.proposal_type, "consume_notes");
+        assert_eq!(meta.consume_notes_metadata_version, Some(2));
+        assert_eq!(
+            meta.consume_notes_notes,
+            vec!["YmFzZTY0Tm90ZQ==".to_string()]
+        );
+        assert_eq!(meta.note_ids, vec!["0xabc".to_string()]);
+    }
+}

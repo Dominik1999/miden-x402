@@ -1,0 +1,39 @@
+[package]
+name = "setup-testnet"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "One-shot Miden testnet setup: deploy faucet, deploy agent account(s), mint + consume tokens, save state for the bench"
+publish = false
+
+[[bin]]
+name = "setup-testnet"
+path = "src/main.rs"
+
+[dependencies]
+miden-client = { workspace = true, features = ["tonic"] }
+miden-client-sqlite-store = { workspace = true }
+miden-protocol = { workspace = true }
+miden-standards = { workspace = true }
+miden-confidential-contracts = { path = "../../crates/contracts" }
+guardian-shared = { path = "../../crates/shared" }
+
+base64 = { workspace = true }
+hex = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+toml = "0.8"
+
+tokio = { workspace = true, features = ["full"] }
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+anyhow = { workspace = true }
+clap = { version = "4.5", features = ["derive"] }
+dotenvy = "0.15"
+rand = { workspace = true }

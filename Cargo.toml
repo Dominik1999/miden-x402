@@ -1,0 +1,74 @@
+[workspace]
+members = [
+    "crates/shared",
+    "crates/client",
+    "crates/server",
+    "crates/server/bench/loadgen",
+    "crates/miden-rpc-client",
+    "crates/miden-keystore",
+    "crates/contracts",
+    "crates/miden-multisig-client",
+    "crates/x402-facilitator-server",
+    "crates/miden-agentic-client",
+    "examples/x402-bench",
+    "examples/reference-merchant",
+    "examples/setup-testnet",
+]
+default-members = [
+    "crates/shared",
+    "crates/client",
+    "crates/server",
+    "crates/miden-rpc-client",
+    "crates/miden-keystore",
+    "crates/contracts",
+    "crates/miden-multisig-client",
+    "crates/x402-facilitator-server",
+    "crates/miden-agentic-client",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.14.6"
+edition = "2024"
+rust-version = "1.93"
+authors = ["miden-x402 contributors"]
+license = "AGPL-3.0"
+repository = "https://github.com/ermvrs/miden-x402"
+homepage = "https://github.com/ermvrs/miden-x402"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+incremental = false
+
+[workspace.dependencies]
+# Core
+serde = "1.0.228"
+serde_json = "1.0.145"
+tokio = "1.47.1"
+tonic = "0.14.2"
+prost = "0.14.1"
+tonic-build = "0.14.1"
+tonic-prost-build = "0.14.2"
+tonic-prost = "0.14.2"
+thiserror = "2.0.9"
+hex = "0.4.3"
+base64 = "0.22"
+rand_chacha = "0.9.0"
+tempfile = "3.15.0"
+rand = "0.9"
+anyhow = { version = "1.0", features = ["backtrace", "std"] }
+assert_matches = "1.5"
+rstest = "0.26"
+futures = "0.3"
+chrono = "0.4"
+
+# Miden
+miden-protocol = "0.14.5"
+miden-standards = "0.14.5"
+miden-tx = "0.14.5"
+miden-node-proto = "0.14.9"
+miden-testing = "0.14.5"
+miden-client = "0.14.5"
+miden-client-sqlite-store = "0.14.5"

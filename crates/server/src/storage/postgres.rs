@@ -1,0 +1,1142 @@
+use crate::delta_object::{DeltaObject, DeltaStatus};
+use crate::schema::{delta_proposals, deltas, states};
+use crate::state_object::StateObject;
+use crate::storage::StorageBackend;
+use crate::storage::{
+    AccountDeltaCursor, AccountProposalCursor, DeltaStatusCounts, DeltaStatusKind,
+    GlobalDeltaCursor, GlobalDeltaRow, GlobalProposalCursor, ProposalRecord, StorageType,
+};
+use async_trait::async_trait;
+use diesel::ConnectionError;
+use diesel::pg::PgConnection;
+use diesel::prelude::*;
+use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+use diesel_async::pooled_connection::ManagerConfig;
+use diesel_async::pooled_connection::deadpool::Pool;
+use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
+use futures_util::FutureExt;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
+use std::sync::{Arc, Once};
+use tokio_postgres_rustls::MakeRustlsConnect;
+
+pub const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
+
+/// Run database migrations. Call once at application startup.
+pub async fn run_migrations(database_url: &str) -> Result<(), String> {
+    let url = database_url.to_string();
+    tokio::task::spawn_blocking(move || {
+        let mut conn = PgConnection::establish(&url)
+            .map_err(|e| format!("Failed to connect for migrations: {e}"))?;
+
+        conn.run_pending_migrations(MIGRATIONS)
+            .map_err(|e| format!("Failed to run migrations: {e}"))?;
+
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|e| format!("Migration task failed: {e}"))??;
+
+    Ok(())
+}
+
+pub struct PostgresService {
+    pool: Pool<AsyncPgConnection>,
+}
+
+impl PostgresService {
+    pub async fn new(database_url: &str, pool_max_size: usize) -> Result<Self, String> {
+        let pool = build_postgres_pool(database_url, pool_max_size).await?;
+        Ok(Self { pool })
+    }
+
+    pub async fn with_pool(pool: Pool<AsyncPgConnection>) -> Self {
+        Self { pool }
+    }
+}
+
+fn database_url_requires_tls(database_url: &str) -> bool {
+    database_url.contains("sslmode=require")
+}
+
+fn install_rustls_provider() {
+    static INSTALL_PROVIDER: Once = Once::new();
+
+    INSTALL_PROVIDER.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
+#[derive(Debug)]
+struct NoCertificateVerification;
+
+impl ServerCertVerifier for NoCertificateVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![
+            SignatureScheme::RSA_PKCS1_SHA1,
+            SignatureScheme::ECDSA_SHA1_Legacy,
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA512,
+            SignatureScheme::ECDSA_NISTP521_SHA512,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PSS_SHA384,
+            SignatureScheme::RSA_PSS_SHA512,
+            SignatureScheme::ED25519,
+            SignatureScheme::ED448,
+        ]
+    }
+}
+
+fn build_rustls_config() -> Result<ClientConfig, ConnectionError> {
+    install_rustls_provider();
+
+    Ok(ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+        .with_no_client_auth())
+}
+
+async fn establish_tls_connection(
+    database_url: &str,
+) -> diesel::ConnectionResult<AsyncPgConnection> {
+    let rustls_config = build_rustls_config()?;
+    let tls = MakeRustlsConnect::new(rustls_config);
+    let (client, connection) = tokio_postgres::connect(database_url, tls)
+        .await
+        .map_err(|error| ConnectionError::BadConnection(error.to_string()))?;
+
+    AsyncPgConnection::try_from_client_and_connection(client, connection).await
+}
+
+fn postgres_connection_manager(
+    database_url: &str,
+) -> AsyncDieselConnectionManager<AsyncPgConnection> {
+    if database_url_requires_tls(database_url) {
+        let mut manager_config = ManagerConfig::default();
+        manager_config.custom_setup = Box::new(|url| establish_tls_connection(url).boxed());
+        AsyncDieselConnectionManager::<AsyncPgConnection>::new_with_config(
+            database_url,
+            manager_config,
+        )
+    } else {
+        AsyncDieselConnectionManager::<AsyncPgConnection>::new(database_url)
+    }
+}
+
+pub(crate) async fn build_postgres_pool(
+    database_url: &str,
+    pool_max_size: usize,
+) -> Result<Pool<AsyncPgConnection>, String> {
+    let pool = Pool::builder(postgres_connection_manager(database_url))
+        .max_size(pool_max_size)
+        .build()
+        .map_err(|error| format!("Failed to create connection pool: {error}"))?;
+
+    let _ = pool
+        .get()
+        .await
+        .map_err(|error| format!("Failed to connect to Postgres: {error}"))?;
+
+    Ok(pool)
+}
+
+// Queryable structs for reading from database
+#[derive(Queryable, Selectable)]
+#[diesel(table_name = states)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+struct StateRow {
+    account_id: String,
+    state_json: serde_json::Value,
+    commitment: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Queryable, Selectable)]
+#[diesel(table_name = deltas)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+struct DeltaRow {
+    #[allow(dead_code)]
+    id: i64,
+    account_id: String,
+    nonce: i64,
+    prev_commitment: String,
+    new_commitment: Option<String>,
+    delta_payload: serde_json::Value,
+    ack_sig: Option<String>,
+    status: serde_json::Value,
+    // Typed mirrors of the lifecycle status kept in `status` Jsonb.
+    // Read-side optimization for dashboard queries; write-side is
+    // dual-populated by Self::derive_status_columns.
+    #[allow(dead_code)]
+    status_kind: String,
+    #[allow(dead_code)]
+    status_timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Queryable, Selectable)]
+#[diesel(table_name = delta_proposals)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+struct ProposalRow {
+    #[allow(dead_code)]
+    id: i64,
+    account_id: String,
+    #[allow(dead_code)]
+    commitment: String,
+    nonce: i64,
+    prev_commitment: String,
+    new_commitment: Option<String>,
+    delta_payload: serde_json::Value,
+    ack_sig: Option<String>,
+    status: serde_json::Value,
+    #[allow(dead_code)]
+    status_kind: String,
+    #[allow(dead_code)]
+    status_timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+// Insertable structs for writing to database
+#[derive(Insertable)]
+#[diesel(table_name = states)]
+struct NewState<'a> {
+    account_id: &'a str,
+    state_json: &'a serde_json::Value,
+    commitment: &'a str,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Insertable, AsChangeset)]
+#[diesel(table_name = deltas)]
+struct NewDelta<'a> {
+    account_id: &'a str,
+    nonce: i64,
+    prev_commitment: &'a str,
+    new_commitment: Option<&'a str>,
+    delta_payload: &'a serde_json::Value,
+    ack_sig: Option<&'a str>,
+    status: serde_json::Value,
+    status_kind: &'a str,
+    status_timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Insertable, AsChangeset)]
+#[diesel(table_name = delta_proposals)]
+struct NewProposal<'a> {
+    account_id: &'a str,
+    commitment: &'a str,
+    nonce: i64,
+    prev_commitment: &'a str,
+    new_commitment: Option<&'a str>,
+    delta_payload: &'a serde_json::Value,
+    ack_sig: Option<&'a str>,
+    status: serde_json::Value,
+    status_kind: &'a str,
+    status_timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+/// Decompose a [`DeltaStatus`] into the typed `(status_kind,
+/// status_timestamp)` pair stored in the indexed columns alongside the
+/// Jsonb `status` blob. Callers must write the Jsonb and the typed
+/// columns atomically (in the same `INSERT`/`UPDATE`) to keep the two
+/// representations in lock-step. A malformed or empty embedded
+/// timestamp surfaces as `Err` rather than silently rewriting the
+/// indexed column to wall-clock now (which would re-order the global
+/// feeds and pollute `latest_activity` on every write to a legacy
+/// row). Spec: feature `005-operator-dashboard-metrics`, Decision 1
+/// (revised).
+fn derive_status_columns(
+    status: &DeltaStatus,
+) -> Result<(&'static str, chrono::DateTime<chrono::Utc>), String> {
+    let kind = match status {
+        DeltaStatus::Pending { .. } => "pending",
+        DeltaStatus::Candidate { .. } => "candidate",
+        DeltaStatus::Canonical { .. } => "canonical",
+        DeltaStatus::Discarded { .. } => "discarded",
+    };
+    let raw = status.timestamp();
+    if raw.is_empty() {
+        return Err(format!(
+            "DeltaStatus::{kind} missing timestamp; refusing to write indexed status_timestamp"
+        ));
+    }
+    let timestamp = chrono::DateTime::parse_from_rfc3339(raw)
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .map_err(|e| format!("DeltaStatus::{kind} timestamp '{raw}' is not RFC-3339: {e}"))?;
+    Ok((kind, timestamp))
+}
+
+impl From<StateRow> for StateObject {
+    fn from(row: StateRow) -> Self {
+        StateObject {
+            account_id: row.account_id,
+            state_json: row.state_json,
+            commitment: row.commitment,
+            created_at: row.created_at.to_rfc3339(),
+            updated_at: row.updated_at.to_rfc3339(),
+            auth_scheme: String::new(),
+        }
+    }
+}
+
+impl From<DeltaRow> for DeltaObject {
+    fn from(row: DeltaRow) -> Self {
+        let status: DeltaStatus =
+            serde_json::from_value(row.status).unwrap_or_else(|_| DeltaStatus::default());
+        DeltaObject {
+            account_id: row.account_id,
+            nonce: row.nonce as u64,
+            prev_commitment: row.prev_commitment,
+            new_commitment: row.new_commitment,
+            delta_payload: row.delta_payload,
+            ack_sig: row.ack_sig.unwrap_or_default(),
+            ack_pubkey: String::new(),
+            ack_scheme: String::new(),
+            status,
+        }
+    }
+}
+
+impl From<ProposalRow> for DeltaObject {
+    fn from(row: ProposalRow) -> Self {
+        let status: DeltaStatus =
+            serde_json::from_value(row.status).unwrap_or_else(|_| DeltaStatus::default());
+        DeltaObject {
+            account_id: row.account_id,
+            nonce: row.nonce as u64,
+            prev_commitment: row.prev_commitment,
+            new_commitment: row.new_commitment,
+            delta_payload: row.delta_payload,
+            ack_sig: row.ack_sig.unwrap_or_default(),
+            ack_pubkey: String::new(),
+            ack_scheme: String::new(),
+            status,
+        }
+    }
+}
+
+#[async_trait]
+impl StorageBackend for PostgresService {
+    fn kind(&self) -> StorageType {
+        StorageType::Postgres
+    }
+
+    async fn submit_state(&self, state: &StateObject) -> Result<(), String> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("Failed to get connection: {e}"))?;
+
+        let created_at: chrono::DateTime<chrono::Utc> = state
+            .created_at
+            .parse()
+            .map_err(|e| format!("Failed to parse created_at: {e}"))?;
+        let updated_at: chrono::DateTime<chrono::Utc> = state
+            .updated_at
+            .parse()
+            .map_err(|e| format!("Failed to parse updated_at: {e}"))?;
+
+        let new_state = NewState {
+            account_id: &state.account_id,
+            state_json: &state.state_json,
+            commitment: &state.commitment,
+            created_at,
+            updated_at,
+        };
+
+        diesel::insert_into(states::table)
+            .values(&new_state)
+            .on_conflict(states::account_id)
+            .do_update()
+            .set((
+                states::state_json.eq(&state.state_json),
+                states::commitment.eq(&state.commitment),
+                states::updated_at.eq(updated_at),
+            ))
+            .execute(&mut conn)
+            .await
+            .map_err(|e| format!("Failed to submit state: {e}"))?;
+
+        Ok(())
+    }
+
+    async fn submit_delta(&self, delta: &DeltaObject) -> Result<(), String> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("Failed to get connection: {e}"))?;
+
+        let status_json = serde_json::to_value(&delta.status)
+            .map_err(|e| format!("Failed to serialize status: {e}"))?;
+        let (status_kind, status_timestamp) = derive_status_columns(&delta.status)?;
+
+        let new_delta = NewDelta {
+            account_id: &delta.account_id,
+            nonce: delta.nonce as i64,
+            prev_commitment: &delta.prev_commitment,
+            new_commitment: delta.new_commitment.as_deref(),
+            delta_payload: &delta.delta_payload,
+            ack_sig: Some(delta.ack_sig.as_str()),
+            status: status_json.clone(),
+            status_kind,
+            status_timestamp,
+        };
+
+        diesel::insert_into(deltas::table)
+            .values(&new_delta)
+            .on_conflict((deltas::account_id, deltas::nonce))
+            .do_update()
+            .set((
+                deltas::prev_commitment.eq(&delta.prev_commitment),
+                deltas::new_commitment.eq(&delta.new_commitment),
+                deltas::delta_payload.eq(&delta.delta_payload),
+                deltas::ack_sig.eq(Some(&delta.ack_sig)),
+                deltas::status.eq(&status_json),
+                deltas::status_kind.eq(status_kind),
+                deltas::status_timestamp.eq(status_timestamp),
+            ))
+            .execute(&mut conn)
+            .await
+            .map_err(|e| format!("Failed to submit delta: {e}"))?;
+
+        Ok(())
+    }
+
+    async fn pull_state(&self, account_id: &str) -> Result<StateObject, String> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("Failed to get connection: {e}"))?;
+
+        let row: StateRow = states::table
+            .filter(states::account_id.eq(account_id))
+            .select(StateRow::as_select())
+            .first(&mut conn)
+            .await
+            .map_err(|e| format!("Failed to pull state: {e}"))?;
+
+        Ok(row.into())
+    }
+
+    async fn pull_states_batch(
+        &self,
+        account_ids: &[&str],
+    ) -> Result<std::collections::HashMap<String, StateObject>, String> {
+        if account_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("Failed to get connection: {e}"))?;
+
+        let owned: Vec<String> = account_ids.iter().map(|s| (*s).to_string()).collect();
+        let rows: Vec<StateRow> = states::table
+            .filter(states::account_id.eq_any(&owned))
+            .select(StateRow::as_select())
+            .load(&mut conn)
+            .await
+            .map_err(|e| format!("Failed to batch-pull states: {e}"))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let state: StateObject = r.into();
+                (state.account_id.clone(), state)
+            })
+            .collect())
+    }
+
+    async fn pull_delta(&self, account_id: &str, nonce: u64) -> Result<DeltaObject, String> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("Failed to get connection: {e}"))?;
+
+        let row: DeltaRow = deltas::table
+            .filter(deltas::account_id.eq(account_id))
+            .filter(deltas::nonce.eq(nonce as i64))
+            .select(DeltaRow::as_select())
+            .first(&mut conn)
+            .await
+            .map_err(|e| format!("Failed to pull delta: {e}"))?;
+
+        Ok(row.into())
+    }
+
+    async fn pull_deltas_after(
+        &self,
+        account_id: &str,
+        from_nonce: u64,
+    ) -> Result<Vec<DeltaObject>, String> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("Failed to get connection: {e}"))?;
+
+        let rows: Vec<DeltaRow> = deltas::table
+            .filter(deltas::account_id.eq(account_id))
+            .filter(deltas::nonce.ge(from_nonce as i64))
+            .order(deltas::nonce.asc())
+            .select(DeltaRow::as_select())
+            .load(&mut conn)
+            .await
+            .map_err(|e| format!("Failed to pull deltas: {e}"))?;
+
+        Ok(rows.into_iter().map(|r| r.into()).collect())
+    }
+
+    async fn has_pending_candidate(&self, account_id: &str) -> Result<bool, String> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("Failed to get connection: {e}"))?;
+
+        // Query for any delta with candidate status
+        let count: i64 = deltas::table
+            .filter(deltas::account_id.eq(account_id))
+            .filter(diesel::dsl::sql::<diesel::sql_types::Bool>(
+                "status->>'status' = 'candidate'",
+            ))
+            .count()
+            .get_result(&mut conn)
+            .await
+            .map_err(|e| format!("Failed to check pending candidate: {e}"))?;
+
+        Ok(count > 0)
+    }
+
+    async fn pull_canonical_deltas_after(
+        &self,
+        account_id: &str,
+        from_nonce: u64,
+    ) -> Result<Vec<DeltaObject>, String> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("Failed to get connection: {e}"))?;
+
+        let rows: Vec<DeltaRow> = deltas::table
+            .filter(deltas::account_id.eq(account_id))
+            .filter(deltas::nonce.ge(from_nonce as i64))
+            .filter(diesel::dsl::sql::<diesel::sql_types::Bool>(
+                "status->>'status' = 'canonical'",
+            ))
+            .order(deltas::nonce.asc())
+            .select(DeltaRow::as_select())
+            .load(&mut conn)
+            .await
+            .map_err(|e| format!("Failed to pull canonical deltas: {e}"))?;
+
+        Ok(rows.into_iter().map(|r| r.into()).collect())
+    }
+
+    async fn submit_delta_proposal(
+        &self,
+        commitment: &str,
+        proposal: &DeltaObject,
+    ) -> Result<(), String> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("Failed to get connection: {e}"))?;
+
+        let status_json = serde_json::to_value(&proposal.status)
+            .map_err(|e| format!("Failed to serialize status: {e}"))?;
+        let (status_kind, status_timestamp) = derive_status_columns(&proposal.status)?;
+
+        let new_proposal = NewProposal {
+            account_id: &proposal.account_id,
+            commitment,
+            nonce: proposal.nonce as i64,
+            prev_commitment: &proposal.prev_commitment,
+            new_commitment: proposal.new_commitment.as_deref(),
+            delta_payload: &proposal.delta_payload,
+            ack_sig: Some(proposal.ack_sig.as_str()),
+            status: status_json,
+            status_kind,
+            status_timestamp,
+        };
+
+        diesel::insert_into(delta_proposals::table)
+            .values(&new_proposal)
+            .on_conflict((delta_proposals::account_id, delta_proposals::commitment))
+            .do_nothing()
+            .execute(&mut conn)
+            .await
+            .map_err(|e| format!("Failed to submit delta proposal: {e}"))?;
+
+        Ok(())
+    }
+
+    async fn pull_delta_proposal(
+        &self,
+        account_id: &str,
+        commitment: &str,
+    ) -> Result<DeltaObject, String> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("Failed to get connection: {e}"))?;
+
+        let row: ProposalRow = delta_proposals::table
+            .filter(delta_proposals::account_id.eq(account_id))
+            .filter(delta_proposals::commitment.eq(commitment))
+            .select(ProposalRow::as_select())
+            .first(&mut conn)
+            .await
+            .map_err(|e| format!("Failed to pull delta proposal: {e}"))?;
+
+        Ok(row.into())
+    }
+
+    async fn pull_all_delta_proposals(&self, account_id: &str) -> Result<Vec<DeltaObject>, String> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("Failed to get connection: {e}"))?;
+
+        let rows: Vec<ProposalRow> = delta_proposals::table
+            .filter(delta_proposals::account_id.eq(account_id))
+            .order(delta_proposals::nonce.asc())
+            .select(ProposalRow::as_select())
+            .load(&mut conn)
+            .await
+            .map_err(|e| format!("Failed to pull all delta proposals: {e}"))?;
+
+        Ok(rows.into_iter().map(|r| r.into()).collect())
+    }
+
+    async fn pull_pending_proposals(&self, account_id: &str) -> Result<Vec<DeltaObject>, String> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("Failed to get connection: {e}"))?;
+
+        let rows: Vec<ProposalRow> = delta_proposals::table
+            .filter(delta_proposals::account_id.eq(account_id))
+            .filter(diesel::dsl::sql::<diesel::sql_types::Bool>(
+                "status->>'status' = 'pending'",
+            ))
+            .order(delta_proposals::nonce.asc())
+            .select(ProposalRow::as_select())
+            .load(&mut conn)
+            .await
+            .map_err(|e| format!("Failed to pull pending proposals: {e}"))?;
+
+        Ok(rows.into_iter().map(|r| r.into()).collect())
+    }
+
+    async fn update_delta_proposal(
+        &self,
+        commitment: &str,
+        proposal: &DeltaObject,
+    ) -> Result<(), String> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("Failed to get connection: {e}"))?;
+
+        let status_json = serde_json::to_value(&proposal.status)
+            .map_err(|e| format!("Failed to serialize status: {e}"))?;
+        let (status_kind, status_timestamp) = derive_status_columns(&proposal.status)?;
+
+        diesel::update(delta_proposals::table)
+            .filter(delta_proposals::account_id.eq(&proposal.account_id))
+            .filter(delta_proposals::commitment.eq(commitment))
+            .set((
+                delta_proposals::nonce.eq(proposal.nonce as i64),
+                delta_proposals::prev_commitment.eq(&proposal.prev_commitment),
+                delta_proposals::new_commitment.eq(&proposal.new_commitment),
+                delta_proposals::delta_payload.eq(&proposal.delta_payload),
+                delta_proposals::ack_sig.eq(Some(&proposal.ack_sig)),
+                delta_proposals::status.eq(&status_json),
+                delta_proposals::status_kind.eq(status_kind),
+                delta_proposals::status_timestamp.eq(status_timestamp),
+            ))
+            .execute(&mut conn)
+            .await
+            .map_err(|e| format!("Failed to update delta proposal: {e}"))?;
+
+        Ok(())
+    }
+
+    async fn delete_delta_proposal(
+        &self,
+        account_id: &str,
+        commitment: &str,
+    ) -> Result<(), String> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("Failed to get connection: {e}"))?;
+
+        diesel::delete(delta_proposals::table)
+            .filter(delta_proposals::account_id.eq(account_id))
+            .filter(delta_proposals::commitment.eq(commitment))
+            .execute(&mut conn)
+            .await
+            .map_err(|e| format!("Failed to delete delta proposal: {e}"))?;
+
+        Ok(())
+    }
+
+    async fn delete_delta(&self, account_id: &str, nonce: u64) -> Result<(), String> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("Failed to get connection: {e}"))?;
+
+        diesel::delete(deltas::table)
+            .filter(deltas::account_id.eq(account_id))
+            .filter(deltas::nonce.eq(nonce as i64))
+            .execute(&mut conn)
+            .await
+            .map_err(|e| format!("Failed to delete delta: {e}"))?;
+
+        Ok(())
+    }
+
+    async fn update_delta_status(
+        &self,
+        account_id: &str,
+        nonce: u64,
+        status: DeltaStatus,
+    ) -> Result<(), String> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("Failed to get connection: {e}"))?;
+
+        let status_json = serde_json::to_value(&status)
+            .map_err(|e| format!("Failed to serialize status: {e}"))?;
+        let (status_kind, status_timestamp) = derive_status_columns(&status)?;
+
+        diesel::update(deltas::table)
+            .filter(deltas::account_id.eq(account_id))
+            .filter(deltas::nonce.eq(nonce as i64))
+            .set((
+                deltas::status.eq(&status_json),
+                deltas::status_kind.eq(status_kind),
+                deltas::status_timestamp.eq(status_timestamp),
+            ))
+            .execute(&mut conn)
+            .await
+            .map_err(|e| format!("Failed to update delta status: {e}"))?;
+
+        Ok(())
+    }
+
+    // ----------------------------------------------------------------------
+    // Dashboard read APIs (feature `005-operator-dashboard-metrics`).
+    //
+    // SQL pushdown over the typed `status_kind` / `status_timestamp`
+    // columns plus the composite indexes from migration
+    // 2026-05-10-000001. Single query per request — no fan-out.
+    // ----------------------------------------------------------------------
+
+    async fn list_account_deltas_paged(
+        &self,
+        account_id: &str,
+        limit: u32,
+        cursor: Option<AccountDeltaCursor>,
+    ) -> Result<Vec<DeltaObject>, String> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("Failed to get connection: {e}"))?;
+
+        let mut query = deltas::table
+            .filter(deltas::account_id.eq(account_id))
+            // pending entries are returned via the proposal queue.
+            .filter(deltas::status_kind.ne("pending"))
+            .into_boxed();
+
+        if let Some(c) = cursor {
+            query = query.filter(deltas::nonce.lt(c.last_nonce));
+        }
+
+        let rows: Vec<DeltaRow> = query
+            .order(deltas::nonce.desc())
+            .limit(limit as i64)
+            .select(DeltaRow::as_select())
+            .load(&mut conn)
+            .await
+            .map_err(|e| format!("Failed to list account deltas: {e}"))?;
+
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    async fn list_account_proposals_paged(
+        &self,
+        account_id: &str,
+        limit: u32,
+        cursor: Option<AccountProposalCursor>,
+    ) -> Result<Vec<ProposalRecord>, String> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("Failed to get connection: {e}"))?;
+
+        let mut query = delta_proposals::table
+            .filter(delta_proposals::account_id.eq(account_id))
+            .filter(delta_proposals::status_kind.eq("pending"))
+            .into_boxed();
+
+        if let Some(c) = cursor {
+            // Composite cursor predicate on `(nonce DESC, commitment
+            // DESC)`. `(account_id, nonce)` is NOT unique on
+            // `delta_proposals` — two operators can submit competing
+            // proposals at the same nonce — so the commitment is the
+            // deterministic tiebreaker.
+            query = query.filter(
+                delta_proposals::nonce
+                    .lt(c.last_nonce)
+                    .or(delta_proposals::nonce
+                        .eq(c.last_nonce)
+                        .and(delta_proposals::commitment.lt(c.last_commitment.clone()))),
+            );
+        }
+
+        let rows: Vec<ProposalRow> = query
+            .order((
+                delta_proposals::nonce.desc(),
+                delta_proposals::commitment.desc(),
+            ))
+            .limit(limit as i64)
+            .select(ProposalRow::as_select())
+            .load(&mut conn)
+            .await
+            .map_err(|e| format!("Failed to list account proposals: {e}"))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| ProposalRecord {
+                account_id: row.account_id.clone(),
+                commitment: row.commitment.clone(),
+                proposal: row.into(),
+            })
+            .collect())
+    }
+
+    async fn list_global_deltas_paged(
+        &self,
+        limit: u32,
+        cursor: Option<GlobalDeltaCursor>,
+        status_filter: Option<Vec<DeltaStatusKind>>,
+    ) -> Result<Vec<GlobalDeltaRow>, String> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("Failed to get connection: {e}"))?;
+
+        let mut query = deltas::table
+            // Pending entries don't surface on the delta feed even
+            // without an explicit filter (they live on the proposal
+            // feed).
+            .filter(deltas::status_kind.ne("pending"))
+            .into_boxed();
+
+        if let Some(kinds) = status_filter {
+            // Coerce typed enum to the stable string column values.
+            let allowed: Vec<String> = kinds.iter().map(|k| k.as_str().to_string()).collect();
+            query = query.filter(deltas::status_kind.eq_any(allowed));
+        }
+
+        if let Some(c) = cursor {
+            // Cursor predicate over the composite sort key
+            // `(status_timestamp DESC, account_id ASC, nonce ASC)`.
+            // `(account_id, nonce)` is unique on `deltas`, so this
+            // composite tuple is fully deterministic.
+            query = query.filter(
+                deltas::status_timestamp
+                    .lt(c.last_status_timestamp)
+                    .or(deltas::status_timestamp
+                        .eq(c.last_status_timestamp)
+                        .and(deltas::account_id.gt(c.last_account_id.clone())))
+                    .or(deltas::status_timestamp
+                        .eq(c.last_status_timestamp)
+                        .and(deltas::account_id.eq(c.last_account_id))
+                        .and(deltas::nonce.gt(c.last_nonce))),
+            );
+        }
+
+        let rows: Vec<DeltaRow> = query
+            .order((
+                deltas::status_timestamp.desc(),
+                deltas::account_id.asc(),
+                deltas::nonce.asc(),
+            ))
+            .limit(limit as i64)
+            .select(DeltaRow::as_select())
+            .load(&mut conn)
+            .await
+            .map_err(|e| format!("Failed to list global deltas: {e}"))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| GlobalDeltaRow {
+                account_id: row.account_id.clone(),
+                delta: row.into(),
+            })
+            .collect())
+    }
+
+    async fn list_global_proposals_paged(
+        &self,
+        limit: u32,
+        cursor: Option<GlobalProposalCursor>,
+    ) -> Result<Vec<ProposalRecord>, String> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("Failed to get connection: {e}"))?;
+
+        let mut query = delta_proposals::table
+            .filter(delta_proposals::status_kind.eq("pending"))
+            .into_boxed();
+
+        if let Some(c) = cursor {
+            // Composite cursor on `(status_timestamp DESC, account_id
+            // ASC, nonce ASC, commitment ASC)`. The four-tuple is
+            // unique because `(account_id, commitment)` is the
+            // delta_proposals UNIQUE constraint.
+            query = query.filter(
+                delta_proposals::status_timestamp
+                    .lt(c.last_originating_timestamp)
+                    .or(delta_proposals::status_timestamp
+                        .eq(c.last_originating_timestamp)
+                        .and(delta_proposals::account_id.gt(c.last_account_id.clone())))
+                    .or(delta_proposals::status_timestamp
+                        .eq(c.last_originating_timestamp)
+                        .and(delta_proposals::account_id.eq(c.last_account_id.clone()))
+                        .and(delta_proposals::nonce.gt(c.last_nonce)))
+                    .or(delta_proposals::status_timestamp
+                        .eq(c.last_originating_timestamp)
+                        .and(delta_proposals::account_id.eq(c.last_account_id))
+                        .and(delta_proposals::nonce.eq(c.last_nonce))
+                        .and(delta_proposals::commitment.gt(c.last_commitment))),
+            );
+        }
+
+        let rows: Vec<ProposalRow> = query
+            .order((
+                delta_proposals::status_timestamp.desc(),
+                delta_proposals::account_id.asc(),
+                delta_proposals::nonce.asc(),
+                delta_proposals::commitment.asc(),
+            ))
+            .limit(limit as i64)
+            .select(ProposalRow::as_select())
+            .load(&mut conn)
+            .await
+            .map_err(|e| format!("Failed to list global proposals: {e}"))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| ProposalRecord {
+                account_id: row.account_id.clone(),
+                commitment: row.commitment.clone(),
+                proposal: row.into(),
+            })
+            .collect())
+    }
+
+    async fn count_deltas_by_status(&self) -> Result<DeltaStatusCounts, String> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("Failed to get connection: {e}"))?;
+
+        let rows: Vec<(String, i64)> = deltas::table
+            .group_by(deltas::status_kind)
+            .select((deltas::status_kind, diesel::dsl::count_star()))
+            .load::<(String, i64)>(&mut conn)
+            .await
+            .map_err(|e| format!("Failed to count deltas by status: {e}"))?;
+
+        let mut counts = DeltaStatusCounts::default();
+        for (kind, n) in rows {
+            let n = n.max(0) as u64;
+            match kind.as_str() {
+                "candidate" => counts.candidate = n,
+                "canonical" => counts.canonical = n,
+                "discarded" => counts.discarded = n,
+                // `pending` is exposed via count_in_flight_proposals,
+                // not the delta status counts.
+                "pending" => {}
+                other => {
+                    // The migration's CHECK constraint should make this
+                    // unreachable. Log so a future lifecycle status
+                    // addition shows up in tests/ops instead of
+                    // silently zeroing the counter.
+                    tracing::warn!(
+                        unexpected_status_kind = other,
+                        count = n,
+                        "count_deltas_by_status: unknown status_kind in deltas table"
+                    );
+                }
+            }
+        }
+        Ok(counts)
+    }
+
+    async fn count_in_flight_proposals(&self) -> Result<u64, String> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("Failed to get connection: {e}"))?;
+
+        let n: i64 = delta_proposals::table
+            .filter(delta_proposals::status_kind.eq("pending"))
+            .count()
+            .get_result(&mut conn)
+            .await
+            .map_err(|e| format!("Failed to count in-flight proposals: {e}"))?;
+
+        Ok(n.max(0) as u64)
+    }
+
+    async fn latest_activity_timestamp(
+        &self,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("Failed to get connection: {e}"))?;
+
+        let max_delta: Option<chrono::DateTime<chrono::Utc>> = deltas::table
+            .select(diesel::dsl::max(deltas::status_timestamp))
+            .first(&mut conn)
+            .await
+            .map_err(|e| format!("Failed to read max delta status_timestamp: {e}"))?;
+
+        let max_proposal: Option<chrono::DateTime<chrono::Utc>> = delta_proposals::table
+            .select(diesel::dsl::max(delta_proposals::status_timestamp))
+            .first(&mut conn)
+            .await
+            .map_err(|e| format!("Failed to read max proposal status_timestamp: {e}"))?;
+
+        Ok(match (max_delta, max_proposal) {
+            (None, None) => None,
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (Some(a), Some(b)) => Some(if a >= b { a } else { b }),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_sslmode_require() {
+        assert!(database_url_requires_tls(
+            "postgres://guardian:password@example.com:5432/guardian?sslmode=require",
+        ));
+    }
+
+    #[test]
+    fn ignores_non_tls_database_urls() {
+        assert!(!database_url_requires_tls(
+            "postgres://guardian:password@localhost:5432/guardian",
+        ));
+    }
+
+    fn create_test_delta(account_id: &str, nonce: u64) -> DeltaObject {
+        DeltaObject {
+            account_id: account_id.to_string(),
+            nonce,
+            prev_commitment: "0x123".to_string(),
+            new_commitment: Some("0x456".to_string()),
+            delta_payload: serde_json::json!({"test": "payload"}),
+            ack_sig: "0xsig".to_string(),
+            ack_pubkey: String::new(),
+            ack_scheme: String::new(),
+            status: DeltaStatus::Canonical {
+                timestamp: "2024-11-14T12:00:00Z".to_string(),
+            },
+        }
+    }
+
+    fn create_test_state(account_id: &str) -> StateObject {
+        StateObject {
+            account_id: account_id.to_string(),
+            commitment: "0x789".to_string(),
+            state_json: serde_json::json!({"test": "state"}),
+            created_at: "2024-11-14T12:00:00Z".to_string(),
+            updated_at: "2024-11-14T12:00:00Z".to_string(),
+            auth_scheme: String::new(),
+        }
+    }
+
+    #[test]
+    fn test_create_test_delta() {
+        let delta = create_test_delta("0x123", 1);
+        assert_eq!(delta.account_id, "0x123");
+        assert_eq!(delta.nonce, 1);
+    }
+
+    #[test]
+    fn test_create_test_state() {
+        let state = create_test_state("0x123");
+        assert_eq!(state.account_id, "0x123");
+    }
+}
