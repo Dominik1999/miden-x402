@@ -67,10 +67,32 @@ struct PaymentRequired {
     accepts: Vec<AcceptsEntry>,
 }
 
+/// P2ID-style payment signature (existing variant A).
 #[derive(Serialize, Deserialize, Debug)]
 struct PaymentSignature {
     agent_id: String,
     nullifier: String,
+}
+
+/// ADN-style payment signature (variant B). Contains the full signed debit.
+#[derive(Serialize, Deserialize, Debug)]
+struct AdnPaymentSignature {
+    note_id: String,
+    serial_num_hex: [String; 4],
+    merchant_account_id: String,
+    amount: u64,
+    signature_hex: String,
+    prepared_signature_hex: String,
+    expiry_block_height: u32,
+    agent_pubkey_commitment_hex: String,
+}
+
+/// Facilitator ack for ADN payments.
+#[derive(Serialize, Deserialize, Debug)]
+struct AdnFacilitatorAck {
+    accepted_at_unix_micros: u64,
+    facilitator_ack_signature: String,
+    facilitator_pubkey_commitment: String,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -143,14 +165,38 @@ async fn get_resource(State(state): State<AppState>, headers: HeaderMap) -> Resp
                 Ok(s) => s,
                 Err(_) => return bad_request("PAYMENT-SIGNATURE not utf8"),
             };
-            let sig = match decode_payment_signature(header_str) {
-                Ok(s) => s,
-                Err(e) => return bad_request(&format!("malformed PAYMENT-SIGNATURE: {e}")),
+            let bytes = match base64::engine::general_purpose::STANDARD.decode(header_str.as_bytes()) {
+                Ok(b) => b,
+                Err(e) => return bad_request(&format!("PAYMENT-SIGNATURE not base64: {e}")),
             };
-            match call_facilitator_verify(&state, &sig).await {
-                Ok(resp) if resp.valid => emit_resource(&state, &sig, &resp.status),
-                Ok(resp) => payment_required_again(&state, format!("invalid: status={}", resp.status)),
-                Err(e) => internal(&format!("facilitator verify failed: {e}")),
+
+            // Try ADN format first (has "note_id" field), fall back to P2ID format
+            if let Ok(adn_sig) = serde_json::from_slice::<AdnPaymentSignature>(&bytes) {
+                // ADN scheme: relay to facilitator /adn/pay
+                match call_facilitator_adn_pay(&state, &adn_sig).await {
+                    Ok(ack) => {
+                        let pr = PaymentResponse {
+                            agent_id: adn_sig.note_id.clone(),
+                            nullifier: adn_sig.note_id,
+                            status: "accepted".to_string(),
+                        };
+                        let pr_encoded = base64::engine::general_purpose::STANDARD
+                            .encode(serde_json::to_vec(&pr).expect("serialize"));
+                        let mut headers = HeaderMap::new();
+                        headers.insert(HDR_PAYMENT_RESPONSE, HeaderValue::from_str(&pr_encoded).unwrap());
+                        (StatusCode::OK, headers, state.cfg.resource_body.clone()).into_response()
+                    }
+                    Err(e) => payment_required_again(&state, format!("ADN verify failed: {e}")),
+                }
+            } else if let Ok(sig) = serde_json::from_slice::<PaymentSignature>(&bytes) {
+                // P2ID scheme: existing flow
+                match call_facilitator_verify(&state, &sig).await {
+                    Ok(resp) if resp.valid => emit_resource(&state, &sig, &resp.status),
+                    Ok(resp) => payment_required_again(&state, format!("invalid: status={}", resp.status)),
+                    Err(e) => internal(&format!("facilitator verify failed: {e}")),
+                }
+            } else {
+                bad_request("PAYMENT-SIGNATURE: unrecognized format")
             }
         }
     }
@@ -221,6 +267,26 @@ fn internal(msg: &str) -> Response {
 fn decode_payment_signature(value: &str) -> anyhow::Result<PaymentSignature> {
     let bytes = base64::engine::general_purpose::STANDARD.decode(value.as_bytes())?;
     Ok(serde_json::from_slice(&bytes)?)
+}
+
+/// Relay the ADN signed debit to the facilitator's /adn/pay endpoint.
+async fn call_facilitator_adn_pay(
+    state: &AppState,
+    sig: &AdnPaymentSignature,
+) -> anyhow::Result<AdnFacilitatorAck> {
+    let url = format!("{}/adn/pay", state.facilitator_url.trim_end_matches('/'));
+    let res = state
+        .http
+        .post(url)
+        .json(sig)
+        .send()
+        .await?;
+    if !res.status().is_success() {
+        let status = res.status();
+        let body = res.text().await.unwrap_or_default();
+        anyhow::bail!("facilitator /adn/pay returned {status}: {body}");
+    }
+    Ok(res.json().await?)
 }
 
 async fn call_facilitator_verify(

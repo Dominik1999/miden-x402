@@ -276,7 +276,11 @@ async fn main() -> anyhow::Result<()> {
     let mut all_rows: Vec<PaymentRow> = Vec::new();
 
     if args.scheme == "adn" {
-        // ── ADN mode ──
+        // ── ADN mode: agent only talks to the merchant (matching Base x402 flow) ──
+        //
+        // Step 1: GET /resource → 402
+        // Step 3: GET /resource + Payment-Signature (signed debit) → 200
+        //   (merchant relays to facilitator /adn/pay internally)
         let setup = setup_report.as_ref()
             .ok_or_else(|| anyhow::anyhow!("ADN mode requires --setup-dir"))?;
         let report = &setup.1;
@@ -289,7 +293,6 @@ async fn main() -> anyhow::Result<()> {
         let adn_expiry = report.adn_expiry_block
             .ok_or_else(|| anyhow::anyhow!("setup.toml missing adn_expiry_block"))?;
 
-        // Parse serial from hex
         let serial: miden_protocol::Word = [
             miden_protocol::Felt::new(u64::from_str_radix(adn_serial_hex[0].trim_start_matches("0x"), 16)?),
             miden_protocol::Felt::new(u64::from_str_radix(adn_serial_hex[1].trim_start_matches("0x"), 16)?),
@@ -297,7 +300,6 @@ async fn main() -> anyhow::Result<()> {
             miden_protocol::Felt::new(u64::from_str_radix(adn_serial_hex[3].trim_start_matches("0x"), 16)?),
         ].into();
 
-        // Load the agent's Falcon secret key
         let agent_record = &report.agents[0];
         let setup_dir = &setup.0;
         let sk_bytes = std::fs::read(setup_dir.join(&agent_record.hot_key_path))
@@ -311,7 +313,6 @@ async fn main() -> anyhow::Result<()> {
 
         let adn_client = adn_client::client::AdnClient::new(
             agent_sk,
-            &cfg.facilitator_url,
             adn_note_id.clone(),
             serial,
             adn_balance,
@@ -322,6 +323,7 @@ async fn main() -> anyhow::Result<()> {
         let resource_url = format!("{}/resource", cfg.merchant_url.trim_end_matches('/'));
 
         for i in 0..cfg.payments_per_agent {
+            // Step 1: GET /resource → 402
             let t_resource_get1_sent = now_unix_micros();
             let res = http.get(&resource_url).send().await?;
             let t_402_received = now_unix_micros();
@@ -330,33 +332,32 @@ async fn main() -> anyhow::Result<()> {
             }
             drop(res);
 
-            // Parse the 402 to get amount
             let amount: u64 = cfg.per_tx_amount_cap.parse().unwrap_or(100);
 
-            // Pay via ADN
-            let (ack, timings) = adn_client.pay(merchant_id, amount).await
-                .map_err(|e| anyhow::anyhow!("ADN pay: {e}"))?;
+            // Step 3: sign debit + send to merchant in Payment-Signature header
+            let (signed_debit, timings) = adn_client.sign_debit(merchant_id, amount)
+                .map_err(|e| anyhow::anyhow!("ADN sign: {e}"))?;
 
-            // Second request with facilitator ack as proof
-            let proof = serde_json::json!({
-                "scheme": "adn",
-                "facilitator_ack_signature": ack.facilitator_ack_signature,
-                "facilitator_pubkey_commitment": ack.facilitator_pubkey_commitment,
-            });
-            let proof_b64 = base64::engine::general_purpose::STANDARD
-                .encode(serde_json::to_vec(&proof)?);
-            let t_resource_get2_sent = now_unix_micros();
+            // Encode the signed debit as base64 JSON in the Payment-Signature header
+            let debit_b64 = base64::engine::general_purpose::STANDARD
+                .encode(serde_json::to_vec(&signed_debit)?);
+            let t_send_facilitator = now_unix_micros(); // send = when we hit the merchant
             let res2 = http.get(&resource_url)
-                .header("payment-signature", proof_b64)
+                .header("payment-signature", debit_b64)
                 .send()
                 .await?;
-            let t_resource_delivered = now_unix_micros();
+            let t_ack_received = now_unix_micros(); // ack = merchant response (includes facilitator verify)
+            let t_resource_delivered = t_ack_received; // same request delivers resource
+
             if !res2.status().is_success() {
-                tracing::warn!(status = %res2.status(), "resource delivery failed (non-fatal for bench)");
+                let body = res2.text().await.unwrap_or_default();
+                tracing::error!(iter = i, status = body, "ADN payment failed");
+                all_rows.push(error_row("adn-agent-0", i as u64, format!("got non-200: {body}")));
+                continue;
             }
 
             all_rows.push(PaymentRow {
-                agent_id: format!("adn-agent-0"),
+                agent_id: "adn-agent-0".into(),
                 seq: i as u64,
                 nullifier: adn_note_id.clone(),
                 t_resource_get1_sent,
@@ -364,9 +365,9 @@ async fn main() -> anyhow::Result<()> {
                 t_pay_start: timings.t_pay_start,
                 t_sign_start: timings.t_sign_start,
                 t_sign_end: timings.t_sign_end,
-                t_send_facilitator: timings.t_send_facilitator,
-                t_ack_received: timings.t_ack_received,
-                t_resource_get2_sent,
+                t_send_facilitator,
+                t_ack_received,
+                t_resource_get2_sent: t_send_facilitator, // same request
                 t_resource_delivered,
                 t_batch_started: 0,
                 t_submitted: 0,
