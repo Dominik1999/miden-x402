@@ -605,27 +605,23 @@ async fn run_one_payment(
         payment_requirements_digest: entry.payment_requirements_digest,
     };
 
-    // Step 2: client.pay() — instrumented.
+    // Step 3: Build payment payload locally (kernel exec + sign), then send
+    // to the merchant in a single retry request (matching Base x402 flow).
     sim().await;
-    let (receipt, mut timings) = client.pay_with_metrics(ctx).await?;
+    let (payload, mut timings) = client.build_payment(&ctx).await?;
     sim().await;
-    // Adjust the client-side timestamps so that the wrapped network
-    // delay shows up in `d_facilitator_us` (the metric the design
-    // author is comparing against Base's ~400ms).
-    if sim_oneway_ms > 0 {
-        let delay = sim_oneway_ms * 1000;
-        timings.t_ack_received = timings.t_ack_received.saturating_add(delay);
-    }
-    let nullifier = receipt.reserved_nullifiers.first().cloned().unwrap_or_default();
 
-    // Step 3: GET /resource again with PAYMENT-SIGNATURE header.
-    let sig = PaymentSignature {
-        agent_id: agent_id.to_string(),
-        nullifier: nullifier.clone(),
-    };
+    // Wrap the payload with agent_id for the merchant to relay.
+    let p2id_sig = serde_json::json!({
+        "agent_id": agent_id,
+        "payload": payload,
+    });
     let sig_b64 = base64::engine::general_purpose::STANDARD
-        .encode(serde_json::to_vec(&sig)?);
-    let t_resource_get2_sent = now_unix_micros();
+        .encode(serde_json::to_vec(&p2id_sig)?);
+
+    // Single retry request to the merchant with the full payment.
+    // The merchant relays to the facilitator internally.
+    timings.t_send_facilitator = now_unix_micros();
     sim().await;
     let res2 = http
         .get(resource_url)
@@ -633,7 +629,9 @@ async fn run_one_payment(
         .send()
         .await?;
     sim().await;
-    let t_resource_delivered = now_unix_micros();
+    timings.t_ack_received = now_unix_micros();
+    let t_resource_delivered = timings.t_ack_received; // same response delivers resource
+    let t_resource_get2_sent = timings.t_send_facilitator; // same request
     if !res2.status().is_success() {
         anyhow::bail!(
             "expected 200 on verified GET, got {} body={}",
@@ -641,6 +639,7 @@ async fn run_one_payment(
             res2.text().await.unwrap_or_default()
         );
     }
+    let nullifier = String::new(); // not available from this flow
 
     // Optionally fetch the facilitator's status snapshot so we can
     // capture batch worker timestamps (started/submitted/committed).
@@ -683,7 +682,7 @@ async fn run_one_payment(
 
     Ok(PaymentRow {
         agent_id: agent_id.to_string(),
-        seq: receipt.seq,
+        seq: _iter,
         nullifier,
         t_resource_get1_sent,
         t_402_received,

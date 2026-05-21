@@ -88,6 +88,20 @@ impl AgenticClient {
         Ok(state)
     }
 
+    /// Build a signed payment payload without sending it.
+    /// The caller (bench harness or merchant SDK) is responsible for
+    /// embedding this in the Payment-Signature header and sending to
+    /// the merchant.
+    pub async fn build_payment(
+        &self,
+        ctx: &X402Context,
+    ) -> Result<(AgenticPayload, PayTimings)> {
+        let mut timings = PayTimings::default();
+        timings.t_pay_start = now_unix_micros();
+        let payload = self.build_payload_once(ctx, &mut timings).await?;
+        Ok((payload, timings))
+    }
+
     /// Hot path. Build a payment payload for the given x402 context,
     /// sign with the hot key, submit to the facilitator. Retries once
     /// if the facilitator returns STALE_BASE_STATE.
@@ -116,18 +130,18 @@ impl AgenticClient {
         }
     }
 
-    async fn pay_once(
+    /// Build the payload without sending. Used by `build_payment()`.
+    async fn build_payload_once(
         &self,
         ctx: &X402Context,
         timings: &mut PayTimings,
-    ) -> Result<PaymentReceipt> {
+    ) -> Result<AgenticPayload> {
         let (built_on, next_seq) = {
             let cache = self.pending_cache.read().await;
             (cache.pending_state_commitment.clone(), cache.last_accepted_seq + 1)
         };
 
         if let Some(miden) = &self.miden {
-            // ─── Real Miden path: build a P2ID tx, execute for summary ───
             let recipient = parse_account_id(&ctx.merchant_account_id)?;
             let faucet = parse_account_id(&ctx.asset_faucet_id)?;
             let amount: u64 = ctx
@@ -137,16 +151,10 @@ impl AgenticClient {
             let request = miden.build_p2id_request(recipient, faucet, amount).await?;
             let request_b64 = request_to_base64(&request);
             let summary = miden.execute_for_summary(request).await?;
-
-            // The Word we sign is the summary's own commitment.
             let summary_commitment = summary.to_commitment();
             timings.t_sign_start = now_unix_micros();
             let signature_hex = self.hot_key.sign_word_hex(summary_commitment)?;
             timings.t_sign_end = now_unix_micros();
-
-            // Wire-encode the summary, the consumed-note nullifiers,
-            // and the original TransactionRequest the facilitator
-            // needs to rebuild + prove + submit.
             let tx_summary_json = serde_json::json!({
                 "version": "miden-real-v1",
                 "summary_base64": summary_to_base64(&summary),
@@ -154,25 +162,9 @@ impl AgenticClient {
                 "commitment_hex": word_hex(summary_commitment),
             });
             let nullifiers = extract_input_nullifiers_hex(&summary);
-            // Use the summary's own commitment as the new pending-state
-            // identifier — it's a deterministic, agent-and-facilitator
-            // agreed digest of the entire transition.
             let next_state_hex = word_hex(summary_commitment);
-
-            self
-                .ship_payload(
-                    ctx,
-                    timings,
-                    built_on,
-                    next_seq,
-                    tx_summary_json,
-                    signature_hex,
-                    next_state_hex,
-                    nullifiers,
-                )
-                .await
+            Ok(self.make_payload(ctx, built_on, tx_summary_json, signature_hex, next_state_hex, nullifiers))
         } else {
-            // ─── Placeholder path (kept for tests w/o a Miden node) ───
             let tx_summary = serde_json::json!({
                 "version": "agentic-v1-placeholder",
                 "agent_id": self.agent_id,
@@ -181,56 +173,47 @@ impl AgenticClient {
                 "ctx": ctx,
                 "seq": next_seq,
             });
-
             timings.t_sign_start = now_unix_micros();
             let summary_bytes =
                 serde_json::to_vec(&tx_summary).map_err(AgenticError::Serialize)?;
             let summary_commitment = Hasher::hash(&summary_bytes);
             let signature_hex = self.hot_key.sign_word_hex(summary_commitment)?;
             timings.t_sign_end = now_unix_micros();
-
             let next_state_word = derive_next_state(&built_on, summary_commitment);
             let next_state_hex = word_hex(next_state_word);
             let nullifiers = self.derive_nullifiers(next_seq).await;
-
-            self
-                .ship_payload(
-                    ctx,
-                    timings,
-                    built_on,
-                    next_seq,
-                    tx_summary,
-                    signature_hex,
-                    next_state_hex,
-                    nullifiers,
-                )
-                .await
+            Ok(self.make_payload(ctx, built_on, tx_summary, signature_hex, next_state_hex, nullifiers))
         }
     }
 
-    async fn ship_payload(
+    fn make_payload(
         &self,
         ctx: &X402Context,
-        timings: &mut PayTimings,
         built_on: String,
-        _next_seq: u64,
         tx_summary: serde_json::Value,
         signature_hex: String,
         next_state_hex: String,
         nullifiers: Vec<String>,
-    ) -> Result<PaymentReceipt> {
-
-        let payload = AgenticPayload {
+    ) -> AgenticPayload {
+        AgenticPayload {
             tx_summary,
             hot_key_signature: DeltaSignature {
                 signer_id: self.hot_key.commitment_hex(),
                 signature: ProposalSignature::Falcon { signature: signature_hex },
             },
             x402_context: ctx.clone(),
-            built_on_state_commitment: built_on.clone(),
-            new_state_commitment: next_state_hex.clone(),
+            built_on_state_commitment: built_on,
+            new_state_commitment: next_state_hex,
             claimed_nullifiers: nullifiers,
-        };
+        }
+    }
+
+    async fn pay_once(
+        &self,
+        ctx: &X402Context,
+        timings: &mut PayTimings,
+    ) -> Result<PaymentReceipt> {
+        let payload = self.build_payload_once(ctx, timings).await?;
 
         timings.t_send_facilitator = now_unix_micros();
         let ack = self.facilitator.post_payment(&self.agent_id, &payload).await?;

@@ -67,7 +67,15 @@ struct PaymentRequired {
     accepts: Vec<AcceptsEntry>,
 }
 
-/// P2ID-style payment signature (existing variant A).
+/// P2ID-style payment: the full AgenticPayload from the agent.
+/// The merchant relays this to the facilitator's POST /agents/{id}/payments.
+#[derive(Serialize, Deserialize, Debug)]
+struct P2idPaymentSignature {
+    agent_id: String,
+    payload: serde_json::Value, // the full AgenticPayload JSON
+}
+
+/// Legacy P2ID format (agent_id + nullifier only, for backward compat).
 #[derive(Serialize, Deserialize, Debug)]
 struct PaymentSignature {
     agent_id: String,
@@ -170,11 +178,34 @@ async fn get_resource(State(state): State<AppState>, headers: HeaderMap) -> Resp
                 Err(e) => return bad_request(&format!("PAYMENT-SIGNATURE not base64: {e}")),
             };
 
-            // Try ADN format first (has "note_id" field), fall back to P2ID format
-            if let Ok(adn_sig) = serde_json::from_slice::<AdnPaymentSignature>(&bytes) {
+            // Try P2ID full payload format first (has "agent_id" + "payload"),
+            // then ADN format (has "note_id"), then legacy P2ID (agent_id + nullifier).
+            if let Ok(p2id_full) = serde_json::from_slice::<P2idPaymentSignature>(&bytes) {
+                // P2ID scheme (new flow): relay full payload to facilitator
+                match call_facilitator_p2id_relay(&state, &p2id_full).await {
+                    Ok(ack) => {
+                        let pr = PaymentResponse {
+                            agent_id: p2id_full.agent_id.clone(),
+                            nullifier: ack.get("reserved_nullifiers")
+                                .and_then(|v| v.as_array())
+                                .and_then(|a| a.first())
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            status: "accepted".to_string(),
+                        };
+                        let pr_encoded = base64::engine::general_purpose::STANDARD
+                            .encode(serde_json::to_vec(&pr).expect("serialize"));
+                        let mut headers = HeaderMap::new();
+                        headers.insert(HDR_PAYMENT_RESPONSE, HeaderValue::from_str(&pr_encoded).unwrap());
+                        (StatusCode::OK, headers, state.cfg.resource_body.clone()).into_response()
+                    }
+                    Err(e) => payment_required_again(&state, format!("P2ID relay failed: {e}")),
+                }
+            } else if let Ok(adn_sig) = serde_json::from_slice::<AdnPaymentSignature>(&bytes) {
                 // ADN scheme: relay to facilitator /adn/pay
                 match call_facilitator_adn_pay(&state, &adn_sig).await {
-                    Ok(ack) => {
+                    Ok(_ack) => {
                         let pr = PaymentResponse {
                             agent_id: adn_sig.note_id.clone(),
                             nullifier: adn_sig.note_id,
@@ -189,7 +220,7 @@ async fn get_resource(State(state): State<AppState>, headers: HeaderMap) -> Resp
                     Err(e) => payment_required_again(&state, format!("ADN verify failed: {e}")),
                 }
             } else if let Ok(sig) = serde_json::from_slice::<PaymentSignature>(&bytes) {
-                // P2ID scheme: existing flow
+                // Legacy P2ID: agent_id + nullifier → call facilitator /verify
                 match call_facilitator_verify(&state, &sig).await {
                     Ok(resp) if resp.valid => emit_resource(&state, &sig, &resp.status),
                     Ok(resp) => payment_required_again(&state, format!("invalid: status={}", resp.status)),
@@ -267,6 +298,30 @@ fn internal(msg: &str) -> Response {
 fn decode_payment_signature(value: &str) -> anyhow::Result<PaymentSignature> {
     let bytes = base64::engine::general_purpose::STANDARD.decode(value.as_bytes())?;
     Ok(serde_json::from_slice(&bytes)?)
+}
+
+/// Relay the full P2ID AgenticPayload to the facilitator.
+async fn call_facilitator_p2id_relay(
+    state: &AppState,
+    p2id: &P2idPaymentSignature,
+) -> anyhow::Result<serde_json::Value> {
+    let url = format!(
+        "{}/agents/{}/payments",
+        state.facilitator_url.trim_end_matches('/'),
+        p2id.agent_id
+    );
+    let res = state
+        .http
+        .post(url)
+        .json(&p2id.payload)
+        .send()
+        .await?;
+    if !res.status().is_success() {
+        let status = res.status();
+        let body = res.text().await.unwrap_or_default();
+        anyhow::bail!("facilitator returned {status}: {body}");
+    }
+    Ok(res.json().await?)
 }
 
 /// Relay the ADN signed debit to the facilitator's /adn/pay endpoint.
