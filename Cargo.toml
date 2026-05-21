@@ -10,6 +10,7 @@ members = [
     "crates/miden-multisig-client",
     "crates/x402-facilitator-server",
     "crates/miden-agentic-client",
+    "crates/agent-debit-note",
     "examples/x402-bench",
     "examples/reference-merchant",
     "examples/setup-testnet",

@@ -1,0 +1,21 @@
+[package]
+name = "agent-debit-note"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "AgentDebitNote: pre-funded on-chain note for x402 payments with chain-finality trust model"
+
+[dependencies]
+miden-protocol = { workspace = true }
+miden-standards = { workspace = true }
+miden-tx = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+miden-testing = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros"] }
+anyhow = { workspace = true }
+rand = { workspace = true }
+rand_chacha = { workspace = true }

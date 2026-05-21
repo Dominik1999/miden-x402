@@ -28,6 +28,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-debit-note"
+version = "0.14.6"
+dependencies = [
+ "anyhow",
+ "hex",
+ "miden-protocol",
+ "miden-standards",
+ "miden-testing",
+ "miden-tx",
+ "rand 0.9.4",
+ "rand_chacha 0.9.0",
+ "tokio",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
