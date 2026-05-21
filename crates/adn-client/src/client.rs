@@ -95,7 +95,11 @@ impl AdnClient {
         timings.t_sign_start = now_micros();
         let message = debit_message(self.note_serial, merchant, amount);
         let signature = self.agent_sk.sign(message);
-        let sig_bytes = signature.to_bytes();
+        // Extract raw Falcon signature bytes (without the Signature enum wrapper)
+        let falcon_sig = match &signature {
+            miden_protocol::account::auth::Signature::Falcon512Poseidon2(inner) => inner.to_bytes(),
+            _ => panic!("expected Falcon512Poseidon2 signature"),
+        };
         let prepared_sig = signature.to_prepared_signature(message);
         timings.t_sign_end = now_micros();
 
@@ -104,7 +108,7 @@ impl AdnClient {
             serial_num_hex: word_to_hex_array(self.note_serial),
             merchant_account_id: merchant.to_hex(),
             amount,
-            signature_hex: format!("0x{}", hex::encode(&sig_bytes)),
+            signature_hex: format!("0x{}", hex::encode(&falcon_sig)),
             prepared_signature_hex: format!(
                 "0x{}",
                 hex::encode(
