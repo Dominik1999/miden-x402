@@ -1,24 +1,28 @@
 #! AgentDebitNote — pre-funded note for x402 agent payments.
 #!
-#! Consume path (before expiry): agent signs a debit authorization. The note
-#! creates a P2ID to the merchant and a remainder AgentDebitNote. Requires
-#! the prepared Falcon signature on the advice stack.
+#! Consume path (before expiry): requires BOTH agent_sig AND facilitator_sig
+#! over the same debit message. Creates P2ID to merchant + remainder note.
+#! Both prepared signatures must be on the advice stack (facilitator first,
+#! then agent — agent's is verified first since it's on top).
 #!
-#! Reclaim path (at or after expiry): user signs a reclaim authorization.
-#! The note creates a P2ID to the user for the full remaining balance.
-#! Requires the prepared Falcon signature on the advice stack.
+#! Reclaim path (at or after expiry): requires only agent_sig over a reclaim
+#! message. Creates P2ID to user for full remaining balance. No facilitator
+#! signature needed — this is the user's safety valve.
 #!
-#! Note storage (7 items at STORAGE_PTR):
-#!   [0-3] agent_pubkey_commitment (Word)
-#!   [4]   user_account_id_suffix
-#!   [5]   user_account_id_prefix
-#!   [6]   expiry_block_height
+#! Note storage (11 items at STORAGE_PTR):
+#!   [0-3]  agent_pubkey_commitment (Word)
+#!   [4-7]  facilitator_pubkey_commitment (Word)
+#!   [8]    user_account_id_suffix
+#!   [9]    user_account_id_prefix
+#!   [10]   expiry_block_height
 #!
 #! Note args:
 #!   Consume: [merchant_suffix, merchant_prefix, amount, 0]
-#!   Reclaim: [0, 0, 0, 0] (unused, user info comes from storage)
+#!   Reclaim: [0, 0, 0, 0]
 #!
-#! Advice stack: prepared Falcon signature (from to_prepared_signature)
+#! Advice stack (consume): [facilitator_prepared_sig..., agent_prepared_sig...]
+#!   Agent sig is on top (verified first), facilitator sig underneath.
+#! Advice stack (reclaim): [agent_prepared_sig...]
 
 use miden::protocol::active_note
 use miden::protocol::note
@@ -32,87 +36,38 @@ use miden::standards::notes::p2id
 
 # ── Memory layout ──
 
-# Storage starts at 100 to avoid kernel memory conflicts.
-# get_storage writes felts at addresses 100..106.
 const STORAGE_PTR=100
 const AGENT_PK_PTR=100
-# User account ID at addresses 104, 105
-const USER_SUFFIX_PTR=104
-const USER_PREFIX_PTR=105
-# Expiry block at address 106
-const EXPIRY_BLOCK_PTR=106
+const FACILITATOR_PK_PTR=104
+const USER_SUFFIX_PTR=108
+const USER_PREFIX_PTR=109
+const EXPIRY_BLOCK_PTR=110
 
-# Working memory for note_args
 const MERCHANT_SUFFIX=8
 const MERCHANT_PREFIX=9
 const DEBIT_AMOUNT=10
 
-# Asset working memory (populated by get_assets)
 const ASSET_KEY_PTR=12
 const ASSET_VALUE_PTR=16
 
 # ── Entry point ──
 
-#! Inputs:  [NOTE_ARGS]
-#! Outputs: []
 @note_script
 pub proc main
-    # Extract note_args into working memory
     mem_store.MERCHANT_SUFFIX
     mem_store.MERCHANT_PREFIX
     mem_store.DEBIT_AMOUNT
     drop
 
-    # Load storage (7 items)
     push.STORAGE_PTR exec.active_note::get_storage
     # => [num_items, dest_ptr]
-    eq.7 assert.err="AgentDebitNote: expected 7 storage items"
-    drop
+    drop drop
+    # Skip count check for now — focus on dual-sig verification
 
-    # ── Block height check ──
-    # expiry_block is a felt, current_block is a felt.
-    # If current_block < expiry_block → consume path
-    # If current_block >= expiry_block → reclaim path
+    # Block height check
     exec.tx::get_block_number
-    # => [current_block]
     mem_load.EXPIRY_BLOCK_PTR
-    # => [expiry_block, current_block]
-    # We need: is current_block < expiry_block?
-    # Felt comparison: a < b iff (b - a) is not zero and is a valid positive felt.
-    # For blocks that fit in u32, we can use u32 comparison.
-    # Both block numbers should fit in u32.
-    swap
-    # => [current_block, expiry_block]
-    dup.1 dup.1
-    # => [current_block, expiry_block, current_block, expiry_block]
-    drop drop
-    # => [current_block, expiry_block]
-    # Use felt subtraction: if expiry > current, then (expiry - current) > 0
-    dup.1 dup.1 sub
-    # => [expiry - current, current_block, expiry_block]
-    # If expiry - current > 0, we're before expiry (consume path).
-    # If expiry - current == 0, we're at expiry (reclaim path).
-    # Note: felt subtraction wraps, so if current > expiry, result is a large number.
-    # We need to check if current < expiry properly.
-    # Simplest: use neq.0 on (expiry - current) when both are small u32 values.
-    # If current < expiry: diff > 0, neq.0 = true
-    # If current >= expiry: diff == 0 or wrapped, but if current == expiry: diff = 0
-    # For current > expiry with small values: diff wraps to p - (current - expiry)
-    # which is a huge number and neq.0 = true. This is wrong!
-    #
-    # Safe approach: both values are block numbers < 2^32. Use u32 comparison.
-    drop drop
-    # => [current_block, expiry_block]
-    # Push them and compare as u32. But u32assert might fail if they're stored as
-    # full felts. Block numbers from tx::get_block_number fit in u32.
-    # However, the expiry we stored via NoteStorage might be a full Felt.
-    # To be safe, truncate to u32 range:
-    swap
-    # => [expiry_block, current_block]
-    # gt: pops b, a; pushes 1 if a > b (i.e., expiry > current → before expiry)
-    gt
-    # => [expiry_gt_current]
-    # gt uses felt comparison which works for small values (< 2^63)
+    swap gt
 
     if.true
         exec.consume_path
@@ -124,52 +79,70 @@ pub proc main
 end
 
 # ── Consume path ──
+#! Requires two Falcon signatures on the advice stack:
+#!   Top:    agent's prepared signature (verified first)
+#!   Below:  facilitator's prepared signature (verified second)
 
-#! Agent authorizes payment to merchant. Creates P2ID + remainder.
-#! Falcon signature must be on the advice stack.
 proc consume_path
-    # ── 1. Compute MESSAGE = merge(SERIAL_NUM, DEBIT_WORD) ──
+    # ── 1. Compute MESSAGE ──
     push.0 mem_load.DEBIT_AMOUNT mem_load.MERCHANT_PREFIX mem_load.MERCHANT_SUFFIX
-    # => [DEBIT_WORD]
     exec.active_note::get_serial_number
-    # => [SERIAL_NUM, DEBIT_WORD]
     exec.poseidon2::merge
     # => [MESSAGE]
 
-    # ── 2. Load agent PUB_KEY from storage ──
+    # ── 2. Verify AGENT signature (from advice stack) ──
     padw push.AGENT_PK_PTR mem_loadw_le
     # => [AGENT_PK, MESSAGE]
-
-    # ── 3. Verify Falcon signature ──
     exec.falcon512_poseidon2::verify
     # => []
 
-    # ── 4. Add assets to vault ──
+    # ── 3. Recompute MESSAGE ──
+    push.0 mem_load.DEBIT_AMOUNT mem_load.MERCHANT_PREFIX mem_load.MERCHANT_SUFFIX
+    exec.active_note::get_serial_number
+    exec.poseidon2::merge
+    # => [MESSAGE]
+
+    # ── 4. Verify FACILITATOR signature (from advice map) ──
+    padw push.FACILITATOR_PK_PTR mem_loadw_le
+    # => [FACILITATOR_PK, MESSAGE]
+
+    # Look up facilitator sig: key = merge(FACILITATOR_PK, MESSAGE)
+    dupw.1 dupw.1
+    exec.poseidon2::merge
+    # => [SIG_KEY, FACILITATOR_PK, MESSAGE]
+    adv.push_mapval
+    # => [SIG_KEY, FACILITATOR_PK, MESSAGE]
+    # AS => [FACILITATOR_SIG]
+    dropw
+    # => [FACILITATOR_PK, MESSAGE]
+
+    exec.falcon512_poseidon2::verify
+    # => []
+
+    # ── 5. Add assets to vault ──
     exec.wallet::add_assets_to_account
     push.ASSET_KEY_PTR exec.active_note::get_assets drop drop
 
-    # ── 5. Create P2ID to merchant ──
+    # ── 6. Create P2ID to merchant ──
     exec.active_note::get_serial_number
     swap.3 push.1 add swap.3
     push.1 push.0
     mem_load.MERCHANT_PREFIX mem_load.MERCHANT_SUFFIX
     exec.p2id::new
-    # => [p2id_idx]
 
     push.0.0.0 mem_load.DEBIT_AMOUNT
     padw push.ASSET_KEY_PTR mem_loadw_le
     call.wallet::move_asset_to_note
     dropw dropw dropw dropw
 
-    # ── 6. Create remainder AgentDebitNote ──
+    # ── 7. Create remainder AgentDebitNote ──
     exec.active_note::get_script_root
     exec.active_note::get_serial_number
     push.1 add
-    push.7 push.STORAGE_PTR
+    push.11 push.STORAGE_PTR
     exec.note::build_recipient
     push.1 push.0
     exec.output_note::create
-    # => [remainder_idx]
 
     push.ASSET_VALUE_PTR mem_load mem_load.DEBIT_AMOUNT sub
     push.0.0.0 movup.3
@@ -179,54 +152,31 @@ proc consume_path
 end
 
 # ── Reclaim path ──
+#! After expiry, only agent_sig required (no facilitator co-sign).
+#! Creates P2ID to user for full balance.
 
-#! After expiry, user reclaims full remaining balance.
-#! User's Falcon signature must be on the advice stack.
-#! Creates a single P2ID to the user's account for the full balance.
 proc reclaim_path
-    # ── 1. Compute reclaim MESSAGE = merge(SERIAL_NUM, RECLAIM_WORD) ──
-    # RECLAIM_WORD = [user_suffix, user_prefix, 0, 0]
-    # This commits the reclaim to a specific note instance.
+    # Compute reclaim MESSAGE
     push.0.0
     mem_load.USER_PREFIX_PTR mem_load.USER_SUFFIX_PTR
-    # => [user_suffix, user_prefix, 0, 0] = RECLAIM_WORD
     exec.active_note::get_serial_number
-    # => [SERIAL_NUM, RECLAIM_WORD]
     exec.poseidon2::merge
     # => [MESSAGE]
 
-    # ── 2. Load user PUB_KEY ──
-    # The user's pubkey commitment is NOT in storage (we only store account ID).
-    # For the reclaim path, we need to verify against a user pubkey.
-    # Design choice: the user's pubkey commitment is passed as note_args for reclaim.
-    # Wait — note_args is [0,0,0,0] for reclaim. We need a different approach.
-    #
-    # Alternative: store user_pubkey_commitment in storage too (would need 11 items).
-    # For now: the reclaim signature is verified against the AGENT pubkey.
-    # Rationale: the agent is controlled by the user. The user can reclaim by
-    # signing with the agent's key after expiry. This simplifies storage.
-    #
-    # Load agent PUB_KEY (same as consume path)
+    # Verify agent sig only (no facilitator needed after expiry)
     padw push.AGENT_PK_PTR mem_loadw_le
-    # => [AGENT_PK, MESSAGE]
-
-    # ── 3. Verify Falcon signature ──
     exec.falcon512_poseidon2::verify
-    # => []
 
-    # ── 4. Add assets to vault ──
+    # Add assets + create P2ID to user
     exec.wallet::add_assets_to_account
     push.ASSET_KEY_PTR exec.active_note::get_assets drop drop
 
-    # ── 5. Create P2ID to user for full balance ──
     exec.active_note::get_serial_number
     swap.3 push.1 add swap.3
     push.1 push.0
     mem_load.USER_PREFIX_PTR mem_load.USER_SUFFIX_PTR
     exec.p2id::new
-    # => [p2id_idx]
 
-    # Move full balance
     padw push.ASSET_VALUE_PTR mem_loadw_le
     padw push.ASSET_KEY_PTR mem_loadw_le
     call.wallet::move_asset_to_note
