@@ -522,3 +522,258 @@ async fn test_18_reclaim_without_facilitator_sig_works() -> anyhow::Result<()> {
     println!("Test #18 PASSED: reclaim works without facilitator sig");
     Ok(())
 }
+
+// ══════════════════════════════════════════════════════════════════════
+// ATTACK VECTOR TESTS
+// ══════════════════════════════════════════════════════════════════════
+
+/// Attack: Agent sends note to a DIFFERENT facilitator (not in storage).
+/// The wrong facilitator signs with its own key, but that key isn't in
+/// the note's storage → facilitator sig verification fails.
+#[tokio::test]
+async fn test_attack_different_facilitator() -> anyhow::Result<()> {
+    let agent_sk = make_keypair(20);
+    let pk: Word = agent_sk.public_key().to_commitment().into();
+    let s = setup_test(pk, 1000, serial(20,2,3,4), 1_000_000)?;
+    let msg = debit_message(s.serial_num, s.merchant_id, 100);
+
+    // Rogue facilitator signs correctly but its key isn't in note storage
+    let rogue_facilitator = make_keypair(2000);
+    let agent_sig = agent_sk.sign(msg);
+    let rogue_fac_sig = rogue_facilitator.sign(msg);
+
+    // Agent sig on stack, rogue facilitator sig in map keyed by rogue pk
+    let rogue_pk: Word = rogue_facilitator.public_key().to_commitment().into();
+    let rogue_key = Hasher::merge(&[rogue_pk, msg]);
+
+    let advice = AdviceInputs::default()
+        .with_stack(agent_sig.to_prepared_signature(msg))
+        .with_map([(rogue_key, rogue_fac_sig.to_prepared_signature(msg))]);
+
+    let tx = s.mock_chain
+        .build_tx_context(s.consumer_id, &[s.note_id], &[])?
+        .extend_note_args(note_args_for(s.merchant_id, 100, s.note_id))
+        .add_note_script(s.note_script)
+        .extend_advice_inputs(advice)
+        .build()?;
+
+    assert!(tx.execute().await.is_err(),
+        "ATTACK FAILED TO PREVENT: different facilitator should be rejected");
+    println!("ATTACK BLOCKED: different facilitator rejected");
+    Ok(())
+}
+
+/// Attack: Facilitator signs for merchant A but agent signed for merchant B.
+/// Both signatures verify individually but for different messages.
+/// The MASM computes the message from note_args — both sigs must match that.
+#[tokio::test]
+async fn test_attack_facilitator_merchant_mismatch() -> anyhow::Result<()> {
+    let agent_sk = make_keypair(21);
+    let pk: Word = agent_sk.public_key().to_commitment().into();
+    let s = setup_test(pk, 1000, serial(21,2,3,4), 1_000_000)?;
+
+    // Agent signs for merchant_id (correct)
+    let agent_msg = debit_message(s.serial_num, s.merchant_id, 100);
+    let agent_sig = agent_sk.sign(agent_msg);
+
+    // Facilitator signs for user_id (wrong merchant)
+    let fac_msg = debit_message(s.serial_num, s.user_id, 100);
+    let fac_sig = s.facilitator_sk.sign(fac_msg);
+
+    // MASM recomputes message from note_args (which says merchant_id).
+    // Agent sig matches → passes.
+    // Facilitator sig is over a different message → adv.push_mapval uses
+    // merge(FAC_PK, note_args_message) as key, but we stored at
+    // merge(FAC_PK, fac_msg) → key mismatch → lookup fails.
+    let fac_pk: Word = s.facilitator_sk.public_key().to_commitment().into();
+    let fac_key = Hasher::merge(&[fac_pk, fac_msg]);
+
+    let advice = AdviceInputs::default()
+        .with_stack(agent_sig.to_prepared_signature(agent_msg))
+        .with_map([(fac_key, fac_sig.to_prepared_signature(fac_msg))]);
+
+    let tx = s.mock_chain
+        .build_tx_context(s.consumer_id, &[s.note_id], &[])?
+        .extend_note_args(note_args_for(s.merchant_id, 100, s.note_id))
+        .add_note_script(s.note_script)
+        .extend_advice_inputs(advice)
+        .build()?;
+
+    assert!(tx.execute().await.is_err(),
+        "ATTACK FAILED TO PREVENT: facilitator signing for wrong merchant should be rejected");
+    println!("ATTACK BLOCKED: facilitator-merchant mismatch rejected");
+    Ok(())
+}
+
+/// Attack: Facilitator signs for 100 USDC but agent signed for 200 USDC.
+/// Same idea: message mismatch between the two signers.
+#[tokio::test]
+async fn test_attack_facilitator_amount_mismatch() -> anyhow::Result<()> {
+    let agent_sk = make_keypair(22);
+    let pk: Word = agent_sk.public_key().to_commitment().into();
+    let s = setup_test(pk, 1000, serial(22,2,3,4), 1_000_000)?;
+
+    // Agent signs for 200
+    let agent_msg = debit_message(s.serial_num, s.merchant_id, 200);
+    let agent_sig = agent_sk.sign(agent_msg);
+
+    // Facilitator signs for 100 (different amount)
+    let fac_msg = debit_message(s.serial_num, s.merchant_id, 100);
+    let fac_sig = s.facilitator_sk.sign(fac_msg);
+
+    // Note args say 200 (matches agent), MASM message = msg(merchant, 200)
+    // Agent sig passes. Facilitator key lookup: merge(fac_pk, msg(merchant, 200))
+    // but we stored at merge(fac_pk, msg(merchant, 100)) → key mismatch → fails.
+    let fac_pk: Word = s.facilitator_sk.public_key().to_commitment().into();
+    let fac_key = Hasher::merge(&[fac_pk, fac_msg]);
+
+    let advice = AdviceInputs::default()
+        .with_stack(agent_sig.to_prepared_signature(agent_msg))
+        .with_map([(fac_key, fac_sig.to_prepared_signature(fac_msg))]);
+
+    let tx = s.mock_chain
+        .build_tx_context(s.consumer_id, &[s.note_id], &[])?
+        .extend_note_args(note_args_for(s.merchant_id, 200, s.note_id))
+        .add_note_script(s.note_script)
+        .extend_advice_inputs(advice)
+        .build()?;
+
+    assert!(tx.execute().await.is_err(),
+        "ATTACK FAILED TO PREVENT: facilitator amount mismatch should be rejected");
+    println!("ATTACK BLOCKED: facilitator-amount mismatch rejected");
+    Ok(())
+}
+
+/// Attack: Agent tries to reclaim funds BEFORE expiry using reclaim path.
+/// Should fail because the block height check routes to consume path,
+/// and the reclaim message won't match the consume message.
+#[tokio::test]
+async fn test_attack_early_reclaim() -> anyhow::Result<()> {
+    let agent_sk = make_keypair(23);
+    let pk: Word = agent_sk.public_key().to_commitment().into();
+    let s = setup_test(pk, 1000, serial(23,2,3,4), 1_000_000)?; // far future expiry
+
+    let msg = reclaim_message(s.serial_num, s.user_id);
+    let advice = agent_only_advice(&agent_sk, msg);
+
+    let mut args = BTreeMap::new();
+    args.insert(s.note_id, [Felt::ZERO, Felt::ZERO, Felt::ZERO, Felt::ZERO].into());
+
+    let tx = s.mock_chain
+        .build_tx_context(s.consumer_id, &[s.note_id], &[])?
+        .extend_note_args(args)
+        .add_note_script(s.note_script)
+        .extend_advice_inputs(advice)
+        .build()?;
+
+    assert!(tx.execute().await.is_err(),
+        "ATTACK FAILED TO PREVENT: early reclaim should be rejected");
+    println!("ATTACK BLOCKED: early reclaim rejected");
+    Ok(())
+}
+
+/// Attack: Random third party tries to consume note without any valid signature.
+/// They have the note data but no agent or facilitator keys.
+#[tokio::test]
+async fn test_attack_unauthorized_consumer() -> anyhow::Result<()> {
+    let agent_sk = make_keypair(24);
+    let pk: Word = agent_sk.public_key().to_commitment().into();
+    let s = setup_test(pk, 1000, serial(24,2,3,4), 1_000_000)?;
+
+    // Random third party signs with their own key (not agent or facilitator)
+    let attacker = make_keypair(2400);
+    let msg = debit_message(s.serial_num, s.merchant_id, 100);
+    let attacker_sig = attacker.sign(msg);
+
+    // Attacker puts their sig on stack — will fail agent verification
+    let advice = AdviceInputs::default()
+        .with_stack(attacker_sig.to_prepared_signature(msg));
+
+    let tx = s.mock_chain
+        .build_tx_context(s.consumer_id, &[s.note_id], &[])?
+        .extend_note_args(note_args_for(s.merchant_id, 100, s.note_id))
+        .add_note_script(s.note_script)
+        .extend_advice_inputs(advice)
+        .build()?;
+
+    assert!(tx.execute().await.is_err(),
+        "ATTACK FAILED TO PREVENT: unauthorized consumer should be rejected");
+    println!("ATTACK BLOCKED: unauthorized consumer rejected");
+    Ok(())
+}
+
+/// Attack: Facilitator tries to change the merchant (redirect payment).
+/// Facilitator signs for attacker_account but agent signed for real merchant.
+/// Note args set to attacker_account → MASM message uses attacker_account →
+/// agent sig (for real merchant) won't verify → blocked at step 1.
+#[tokio::test]
+async fn test_attack_facilitator_redirects_payment() -> anyhow::Result<()> {
+    let agent_sk = make_keypair(25);
+    let pk: Word = agent_sk.public_key().to_commitment().into();
+    let s = setup_test(pk, 1000, serial(25,2,3,4), 1_000_000)?;
+
+    // Agent signs for the real merchant
+    let real_msg = debit_message(s.serial_num, s.merchant_id, 100);
+    let agent_sig = agent_sk.sign(real_msg);
+
+    // Facilitator changes note_args to redirect to user_id (attacker's account)
+    // MASM recomputes message using note_args → message = msg(user_id, 100)
+    // Agent sig was over msg(merchant_id, 100) → verification fails
+    let redirected_msg = debit_message(s.serial_num, s.user_id, 100);
+    let fac_sig = s.facilitator_sk.sign(redirected_msg);
+
+    let fac_pk: Word = s.facilitator_sk.public_key().to_commitment().into();
+    let fac_key = Hasher::merge(&[fac_pk, redirected_msg]);
+
+    let advice = AdviceInputs::default()
+        .with_stack(agent_sig.to_prepared_signature(real_msg))
+        .with_map([(fac_key, fac_sig.to_prepared_signature(redirected_msg))]);
+
+    // Note args point to user_id (attacker redirect)
+    let tx = s.mock_chain
+        .build_tx_context(s.consumer_id, &[s.note_id], &[])?
+        .extend_note_args(note_args_for(s.user_id, 100, s.note_id))
+        .add_note_script(s.note_script)
+        .extend_advice_inputs(advice)
+        .build()?;
+
+    assert!(tx.execute().await.is_err(),
+        "ATTACK FAILED TO PREVENT: facilitator redirecting payment should be rejected");
+    println!("ATTACK BLOCKED: facilitator payment redirect rejected");
+    Ok(())
+}
+
+/// Attack: Agent tries to inflate the amount (overspend).
+/// Agent signs for 100 but sets note_args to 999.
+/// MASM recomputes msg from note_args (999) → agent sig was for 100 → mismatch.
+#[tokio::test]
+async fn test_attack_agent_inflates_amount() -> anyhow::Result<()> {
+    let agent_sk = make_keypair(26);
+    let pk: Word = agent_sk.public_key().to_commitment().into();
+    let s = setup_test(pk, 1000, serial(26,2,3,4), 1_000_000)?;
+
+    // Agent signs for 100
+    let msg_100 = debit_message(s.serial_num, s.merchant_id, 100);
+    let agent_sig = agent_sk.sign(msg_100);
+    let fac_sig = s.facilitator_sk.sign(msg_100);
+
+    let fac_pk: Word = s.facilitator_sk.public_key().to_commitment().into();
+    let fac_key = Hasher::merge(&[fac_pk, msg_100]);
+
+    let advice = AdviceInputs::default()
+        .with_stack(agent_sig.to_prepared_signature(msg_100))
+        .with_map([(fac_key, fac_sig.to_prepared_signature(msg_100))]);
+
+    // But note_args says 999 → MASM computes msg(merchant, 999) → doesn't match sig
+    let tx = s.mock_chain
+        .build_tx_context(s.consumer_id, &[s.note_id], &[])?
+        .extend_note_args(note_args_for(s.merchant_id, 999, s.note_id))
+        .add_note_script(s.note_script)
+        .extend_advice_inputs(advice)
+        .build()?;
+
+    assert!(tx.execute().await.is_err(),
+        "ATTACK FAILED TO PREVENT: agent inflating amount should be rejected");
+    println!("ATTACK BLOCKED: agent amount inflation rejected");
+    Ok(())
+}
