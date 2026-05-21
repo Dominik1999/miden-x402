@@ -5,6 +5,7 @@
 //!
 //! See `ideas/DESIGN.md` for the architecture.
 
+pub mod adn;
 pub mod api;
 pub mod error;
 pub mod jobs;

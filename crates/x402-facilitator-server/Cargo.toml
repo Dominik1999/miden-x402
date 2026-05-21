@@ -18,6 +18,9 @@ name = "x402-facilitator-server"
 path = "src/main.rs"
 
 [dependencies]
+# AgentDebitNote
+agent-debit-note = { path = "../agent-debit-note" }
+
 # Vendored guardian
 guardian-server = { path = "../server" }
 guardian-shared = { path = "../shared" }

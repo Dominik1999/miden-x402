@@ -42,8 +42,10 @@ use miden_confidential_contracts::multisig_guardian::{
     MultisigGuardianBuilder, MultisigGuardianConfig,
 };
 use miden_protocol::Word;
+use miden_protocol::note::{Note, NoteAssets, NoteMetadata, NoteRecipient, NoteStorage, NoteTag};
 use miden_protocol::transaction::TransactionSummary;
 use miden_protocol::utils::serde::Serializable;
+use miden_standards::code_builder::CodeBuilder;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
@@ -71,6 +73,19 @@ struct Args {
     /// How many seconds to wait for consumable notes per agent before giving up.
     #[arg(long, default_value_t = 120u64)]
     consumable_wait_secs: u64,
+
+    /// Also create an AgentDebitNote on-chain for the ADN x402 variant.
+    /// The note will hold --adn-amount tokens from the first agent.
+    #[arg(long)]
+    adn: bool,
+
+    /// Amount of tokens to put into the AgentDebitNote.
+    #[arg(long, default_value_t = 100_000u64)]
+    adn_amount: u64,
+
+    /// Expiry block height for the AgentDebitNote (blocks from current).
+    #[arg(long, default_value_t = 100_000u32)]
+    adn_expiry_blocks: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -83,6 +98,15 @@ struct SetupReport {
     agent_count: usize,
     agents: Vec<AgentRecord>,
     mint_amount: u64,
+    /// AgentDebitNote fields (populated when --adn flag is used)
+    #[serde(default)]
+    adn_note_id: Option<String>,
+    #[serde(default)]
+    adn_serial_num_hex: Option<[String; 4]>,
+    #[serde(default)]
+    adn_balance: Option<u64>,
+    #[serde(default)]
+    adn_expiry_block: Option<u32>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -307,6 +331,109 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // ─── 4b. (Optional) Create AgentDebitNote on-chain ───
+    let mut adn_info: Option<(String, Word, u64, u32)> = None;
+    if args.adn && !agents.is_empty() {
+        tracing::info!("creating AgentDebitNote on-chain");
+        let (_i, account, key) = &agents[0];
+        let agent_id = account.id();
+        let sk = match key {
+            AuthSecretKey::Falcon512Poseidon2(sk) => sk.clone(),
+            _ => anyhow::bail!("agent 0 expects Falcon key for ADN"),
+        };
+        let agent_pk_commitment: Word = sk.public_key().to_commitment().into();
+
+        // Get current block for expiry computation
+        client.sync_state().await?;
+        // Use a fixed high expiry for now (the actual block number doesn't matter for benchmarks)
+        let expiry_block = args.adn_expiry_blocks;
+
+        // Compile the AgentDebitNote MASM script
+        let adn_masm = agent_debit_note::note::AGENT_DEBIT_NOTE_MASM;
+        let adn_script = CodeBuilder::default()
+            .compile_note_script(adn_masm)
+            .map_err(|e| anyhow::anyhow!("compile ADN script: {e}"))?;
+
+        // Build the note
+        let adn_asset = FungibleAsset::new(faucet_id, args.adn_amount)
+            .map_err(|e| anyhow::anyhow!("ADN asset: {e:?}"))?;
+        let _merchant_for_storage = merchant.id();
+        let user_id = agent_id; // user = agent's own account for reclaim
+        let adn_storage = NoteStorage::new(vec![
+            agent_pk_commitment[0],
+            agent_pk_commitment[1],
+            agent_pk_commitment[2],
+            agent_pk_commitment[3],
+            user_id.suffix(),
+            user_id.prefix().as_felt(),
+            Felt::new(expiry_block as u64),
+        ])
+        .map_err(|e| anyhow::anyhow!("ADN storage: {e}"))?;
+
+        let adn_serial = {
+            let mut s = [0u8; 32];
+            client.rng().fill_bytes(&mut s);
+            Word::from([
+                Felt::new(u64::from_le_bytes(s[0..8].try_into().unwrap())),
+                Felt::new(u64::from_le_bytes(s[8..16].try_into().unwrap())),
+                Felt::new(u64::from_le_bytes(s[16..24].try_into().unwrap())),
+                Felt::new(u64::from_le_bytes(s[24..32].try_into().unwrap())),
+            ])
+        };
+
+        let adn_metadata = NoteMetadata::new(agent_id, NoteType::Public)
+            .with_tag(NoteTag::new(0));
+        let adn_vault = NoteAssets::new(vec![miden_protocol::asset::Asset::Fungible(adn_asset)])
+            .map_err(|e| anyhow::anyhow!("ADN vault: {e}"))?;
+        let adn_recipient = NoteRecipient::new(adn_serial, adn_script, adn_storage);
+        let adn_note = Note::new(adn_vault, adn_metadata, adn_recipient);
+        let adn_note_id = adn_note.id();
+
+        tracing::info!(%adn_note_id, "ADN note built, submitting tx");
+
+        // Build a transaction that outputs the AgentDebitNote.
+        // The agent's account creates the note, moving assets from its vault.
+        // This uses the MultisigGuardian sign-inject flow (same as consume).
+        let signer_commitment: Word = sk.public_key().to_commitment().into();
+        let req = TransactionRequestBuilder::new()
+            .own_output_notes(vec![adn_note.clone()])
+            .build()
+            .map_err(|e| anyhow::anyhow!("ADN tx request: {e}"))?;
+
+        let summary = execute_for_summary(&mut client, agent_id, req.clone())
+            .await
+            .context("ADN execute_for_summary")?;
+        let message = summary.to_commitment();
+        let sig = sk.sign(message);
+        let sig_hex = format!("0x{}", hex::encode(sig.to_bytes()));
+        let parsed = GuardianSignatureScheme::Falcon
+            .parse_signature_hex(&sig_hex)
+            .map_err(|e| anyhow::anyhow!("ADN parse sig: {e}"))?;
+        let (advice_key, advice_vals) = GuardianSignatureScheme::Falcon
+            .build_signature_advice_entry(signer_commitment, message, &parsed, None)
+            .map_err(|e| anyhow::anyhow!("ADN advice entry: {e}"))?;
+        let mut signed_req = req;
+        signed_req.advice_map_mut().insert(advice_key, advice_vals);
+        let tx_id = client
+            .submit_new_transaction(agent_id, signed_req)
+            .await
+            .context("ADN submit")?;
+        tracing::info!(%tx_id, "ADN note submitted");
+
+        // Wait for inclusion
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        client.sync_state().await?;
+
+        adn_info = Some((
+            format!("0x{}", hex::encode(adn_note_id.to_bytes())),
+            adn_serial,
+            args.adn_amount,
+            expiry_block,
+        ));
+
+        tracing::info!("ADN note created on-chain");
+    }
+
     // ─── 5. Snapshot + save ───
     let agents_dir = args.out_dir.join("agents");
     std::fs::create_dir_all(&agents_dir)?;
@@ -351,6 +478,21 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!(i, "snapshot saved");
     }
 
+    let (adn_note_id, adn_serial_hex, adn_balance, adn_expiry) = match &adn_info {
+        Some((id, serial, balance, expiry)) => (
+            Some(id.clone()),
+            Some([
+                format!("0x{:016x}", serial[0].as_canonical_u64()),
+                format!("0x{:016x}", serial[1].as_canonical_u64()),
+                format!("0x{:016x}", serial[2].as_canonical_u64()),
+                format!("0x{:016x}", serial[3].as_canonical_u64()),
+            ]),
+            Some(*balance),
+            Some(*expiry),
+        ),
+        None => (None, None, None, None),
+    };
+
     let report = SetupReport {
         rpc_endpoint: args.rpc_endpoint.clone(),
         faucet_id_bech32: faucet_bech32,
@@ -360,6 +502,10 @@ async fn main() -> anyhow::Result<()> {
         agent_count: agents.len(),
         agents: report_agents,
         mint_amount: args.mint_amount,
+        adn_note_id,
+        adn_serial_num_hex: adn_serial_hex,
+        adn_balance,
+        adn_expiry_block: adn_expiry,
     };
     let toml_path = args.out_dir.join("setup.toml");
     std::fs::write(&toml_path, toml::to_string_pretty(&report)?)?;

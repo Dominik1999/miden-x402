@@ -36,6 +36,7 @@ pub fn router(state: AppState) -> Router {
         .route("/agents/{agent_id}/payments/{nullifier}", get(get_payment_status))
         .route("/verify", post(merchant_verify))
         .route("/settle", post(merchant_settle))
+        .route("/adn/pay", post(crate::adn::pay))
         .with_state(state)
 }
 

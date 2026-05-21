@@ -20,6 +20,7 @@ miden-client-sqlite-store = { workspace = true }
 miden-protocol = { workspace = true }
 miden-standards = { workspace = true }
 miden-confidential-contracts = { path = "../../crates/contracts" }
+agent-debit-note = { path = "../../crates/agent-debit-note" }
 guardian-shared = { path = "../../crates/shared" }
 
 base64 = { workspace = true }

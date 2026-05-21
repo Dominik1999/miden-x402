@@ -16,6 +16,8 @@ path = "src/main.rs"
 
 [dependencies]
 miden-agentic-client = { path = "../../crates/miden-agentic-client" }
+adn-client = { path = "../../crates/adn-client" }
+agent-debit-note = { path = "../../crates/agent-debit-note" }
 miden-protocol = { workspace = true }
 
 tokio = { workspace = true, features = ["full"] }

@@ -11,6 +11,7 @@ members = [
     "crates/x402-facilitator-server",
     "crates/miden-agentic-client",
     "crates/agent-debit-note",
+    "crates/adn-client",
     "examples/x402-bench",
     "examples/reference-merchant",
     "examples/setup-testnet",

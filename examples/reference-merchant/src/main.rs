@@ -158,15 +158,26 @@ async fn get_resource(State(state): State<AppState>, headers: HeaderMap) -> Resp
 
 fn emit_402(state: &AppState) -> Response {
     let required = PaymentRequired {
-        accepts: vec![AcceptsEntry {
-            scheme: "miden-p2id-x402".into(),
-            network: "miden:testnet".into(),
-            merchant_account_id: state.cfg.account_id.clone(),
-            asset_faucet_id: state.cfg.asset_faucet_id.clone(),
-            amount: state.cfg.amount.clone(),
-            deadline_unix_secs: state.cfg.deadline_unix_secs,
-            payment_requirements_digest: state.cfg.account_id.clone(),
-        }],
+        accepts: vec![
+            AcceptsEntry {
+                scheme: "miden-p2id-x402".into(),
+                network: "miden:testnet".into(),
+                merchant_account_id: state.cfg.account_id.clone(),
+                asset_faucet_id: state.cfg.asset_faucet_id.clone(),
+                amount: state.cfg.amount.clone(),
+                deadline_unix_secs: state.cfg.deadline_unix_secs,
+                payment_requirements_digest: state.cfg.account_id.clone(),
+            },
+            AcceptsEntry {
+                scheme: "miden-adn-x402".into(),
+                network: "miden:testnet".into(),
+                merchant_account_id: state.cfg.account_id.clone(),
+                asset_faucet_id: state.cfg.asset_faucet_id.clone(),
+                amount: state.cfg.amount.clone(),
+                deadline_unix_secs: state.cfg.deadline_unix_secs,
+                payment_requirements_digest: state.cfg.account_id.clone(),
+            },
+        ],
     };
     let encoded = base64::engine::general_purpose::STANDARD
         .encode(serde_json::to_vec(&required).expect("serialize PaymentRequired"));
