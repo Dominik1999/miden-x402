@@ -232,7 +232,7 @@ log "Distributing config..."
 
 # Agent → local → facilitator/merchant
 scp $SSH_OPTS "${SSH_USER}@${AGENT_IP}:/tmp/bench-config.json" /tmp/bench-config-aws.json
-scp $SSH_OPTS "${SSH_USER}@${AGENT_IP}:/tmp/adn-bench/keystore" /tmp/adn-keystore-aws -r
+scp -r $SSH_OPTS "${SSH_USER}@${AGENT_IP}:/tmp/adn-bench/keystore" /tmp/adn-keystore-aws
 
 scp $SSH_OPTS /tmp/bench-config-aws.json "${SSH_USER}@${FACILITATOR_IP}:/tmp/bench-config.json"
 scp $SSH_OPTS /tmp/bench-config-aws.json "${SSH_USER}@${MERCHANT_IP}:/tmp/bench-config.json"
