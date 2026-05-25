@@ -17,6 +17,7 @@ AMOUNT=1000
 SETTLE_AFTER=25
 ADN_BALANCE=500000
 REGION="${AWS_DEFAULT_REGION:-us-east-1}"
+FACILITATOR_REGION=""  # If set, facilitator runs in a different region
 INSTANCE_TYPE="${BENCH_INSTANCE_TYPE:-t3.xlarge}"
 AMI=""  # auto-detect Ubuntu 22.04
 KEY_NAME="${BENCH_KEY_NAME:-}"
@@ -36,8 +37,9 @@ while [[ $# -gt 0 ]]; do
     --key-file)       KEY_FILE="$2"; shift 2 ;;
     --keep)           KEEP=true; shift ;;
     --branch)         BRANCH="$2"; shift 2 ;;
+    --facilitator-region) FACILITATOR_REGION="$2"; shift 2 ;;
     -h|--help)
-      echo "Usage: $0 [--payments N] [--region REGION] [--instance-type TYPE] [--key-name NAME] [--key-file PATH] [--keep] [--branch BRANCH]"
+      echo "Usage: $0 [--payments N] [--region REGION] [--facilitator-region REGION] [--instance-type TYPE] [--key-name NAME] [--key-file PATH] [--keep] [--branch BRANCH]"
       echo ""
       echo "Env vars: AWS_DEFAULT_REGION, BENCH_KEY_NAME, BENCH_KEY_FILE, BENCH_INSTANCE_TYPE, BENCH_PAYMENTS"
       exit 0 ;;
