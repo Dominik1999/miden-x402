@@ -1,0 +1,55 @@
+[2m2026-05-25T17:17:21.450839Z[0m [32m INFO[0m [2madn_facilitator[0m[2m:[0m imported keystore from /tmp/adn-bench/keystore
+[2m2026-05-25T17:17:21.464555Z[0m [32m INFO[0m [2mrusqlite_migration[0m[2m:[0m Database migrated to version 1
+[2m2026-05-25T17:17:21.491655Z[0m [32m INFO[0m [2mmiden_client::rpc::tonic_client[0m[2m:[0m Calling GetBlockHeaderByNumber: BlockHeaderByNumberRequest { block_num: Some(0), include_mmr_proof: Some(false) }
+[2m2026-05-25T17:17:21.674413Z[0m [32m INFO[0m [2mmiden_client::sync::state_sync[0m[2m:[0m Syncing state. [3mblock_from[0m[2m=[0m0 [3mblock_to[0m[2m=[0m1016039
+[2m2026-05-25T17:17:21.701078Z[0m [32m INFO[0m [2mmiden_client::sync::state_sync[0m[2m:[0m Fetched note sync data. [3mblocks_with_notes[0m[2m=[0m0 [3mnotes[0m[2m=[0m0 [3mpublic_notes[0m[2m=[0m0
+[2m2026-05-25T17:17:21.701211Z[0m [32m INFO[0m [2mmiden_client::sync[0m[2m:[0m Applying changes to the store.
+[2m2026-05-25T17:17:21.768394Z[0m [32m INFO[0m [2mmiden_client::sync::state_sync[0m[2m:[0m Already at chain tip, nothing to sync. [3mblock_num[0m[2m=[0m1016039
+[2m2026-05-25T17:17:21.768432Z[0m [32m INFO[0m [2mmiden_client::sync[0m[2m:[0m Applying changes to the store.
+[2m2026-05-25T17:17:21.768824Z[0m [32m INFO[0m [2madn_facilitator[0m[2m:[0m facilitator ready [3mfacilitator_id[0m[2m=[0m0x224912e277fa5710762d969190a478
+[2m2026-05-25T17:17:21.769015Z[0m [32m INFO[0m [2madn_facilitator[0m[2m:[0m listening on 0.0.0.0:7002
+[2m2026-05-25T17:17:29.992598Z[0m [32m INFO[0m [2mmiden_client::sync::state_sync[0m[2m:[0m Syncing state. [3mblock_from[0m[2m=[0m1016039 [3mblock_to[0m[2m=[0m1016042
+[2m2026-05-25T17:17:30.020159Z[0m [32m INFO[0m [2mmiden_client::sync::state_sync[0m[2m:[0m Fetched note sync data. [3mblocks_with_notes[0m[2m=[0m0 [3mnotes[0m[2m=[0m0 [3mpublic_notes[0m[2m=[0m0
+[2m2026-05-25T17:17:30.049545Z[0m [32m INFO[0m [2mmiden_client::sync[0m[2m:[0m Applying changes to the store.
+[2m2026-05-25T17:17:30.096753Z[0m [32m INFO[0m [2mmiden_client::rpc::tonic_client[0m[2m:[0m Calling GetBlockHeaderByNumber: BlockHeaderByNumberRequest { block_num: Some(1016030), include_mmr_proof: Some(true) }
+[2m2026-05-25T17:17:30.219817Z[0m [32m INFO[0m [2mmiden_client::sync::state_sync[0m[2m:[0m Already at chain tip, nothing to sync. [3mblock_num[0m[2m=[0m1016042
+[2m2026-05-25T17:17:30.219856Z[0m [32m INFO[0m [2mmiden_client::sync[0m[2m:[0m Applying changes to the store.
+[2m2026-05-25T17:17:30.220693Z[0m [32m INFO[0m [2madn_facilitator[0m[2m:[0m note authenticated (attempt 0)
+[2m2026-05-25T17:17:30.224811Z[0m [32m INFO[0m [2madn_facilitator[0m[2m:[0m consuming ADN [3mcumulative[0m[2m=[0m25000
+[2m2026-05-25T17:17:30.249489Z[0m [32m INFO[0m [2mmiden_client::transaction[0m[2m:[0m Proving transaction...
+[2m2026-05-25T17:17:30.485396Z[0m [32m INFO[0m [1mprove_program[0m[2m:[0m [2mmiden_prover[0m[2m:[0m Generated execution trace of 71 columns and 262144 steps (padded from 238134)
+[2m2026-05-25T17:17:59.117257Z[0m [32m INFO[0m [2mmiden_client::transaction[0m[2m:[0m Transaction proven.
+[2m2026-05-25T17:17:59.117297Z[0m [32m INFO[0m [2mmiden_client::transaction[0m[2m:[0m Submitting transaction to the network...
+[2m2026-05-25T17:17:59.504040Z[0m [32m INFO[0m [2mmiden_client::transaction[0m[2m:[0m Transaction submitted.
+[2m2026-05-25T17:17:59.508493Z[0m [32m INFO[0m [2mmiden_client::transaction[0m[2m:[0m Applying transaction to the local store...
+[2m2026-05-25T17:17:59.519617Z[0m [32m INFO[0m [2mmiden_client::transaction[0m[2m:[0m Transaction stored.
+[2m2026-05-25T17:17:59.519704Z[0m [32m INFO[0m [2madn_facilitator[0m[2m:[0m settlement success [3mtx_id[0m[2m=[0m0x67f00295b50e168f5b709d86289def78e3a0675a3d3e28e25c80d004bd76c77a
+[2m2026-05-25T17:17:59.565271Z[0m [32m INFO[0m [2mmiden_client::sync::state_sync[0m[2m:[0m Syncing state. [3mblock_from[0m[2m=[0m1016042 [3mblock_to[0m[2m=[0m1016052
+[2m2026-05-25T17:17:59.598660Z[0m [32m INFO[0m [2mmiden_client::sync::state_sync[0m[2m:[0m Fetched note sync data. [3mblocks_with_notes[0m[2m=[0m0 [3mnotes[0m[2m=[0m0 [3mpublic_notes[0m[2m=[0m0
+[2m2026-05-25T17:17:59.663584Z[0m [32m INFO[0m [2mmiden_client::sync[0m[2m:[0m Applying changes to the store.
+[2m2026-05-25T17:18:02.775947Z[0m [32m INFO[0m [2mmiden_client::sync::state_sync[0m[2m:[0m Syncing state. [3mblock_from[0m[2m=[0m1016052 [3mblock_to[0m[2m=[0m1016053
+[2m2026-05-25T17:18:02.842677Z[0m [32m INFO[0m [2mmiden_client::sync::state_sync[0m[2m:[0m Fetched note sync data. [3mblocks_with_notes[0m[2m=[0m1 [3mnotes[0m[2m=[0m2 [3mpublic_notes[0m[2m=[0m2
+[2m2026-05-25T17:18:02.944802Z[0m [32m INFO[0m [2mmiden_client::sync[0m[2m:[0m Applying changes to the store.
+[2m2026-05-25T17:18:02.965871Z[0m [32m INFO[0m [2madn_facilitator[0m[2m:[0m found remainder ADN output [3mrid[0m[2m=[0m0x6778ad42a0b9912c7c0726ecafa3df35c758e98a36477e9ccd473327b2200665
+[2m2026-05-25T17:18:02.966022Z[0m [32m INFO[0m [2madn_facilitator[0m[2m:[0m found P2ID output [3mrid[0m[2m=[0m0xea4ac9fc176a4bb41a6efe1d45105dcfbb7ab84b3bde9d4bc6e94e5973a458fa
+[2m2026-05-25T17:18:05.681802Z[0m [32m INFO[0m [2mmiden_client::sync::state_sync[0m[2m:[0m Syncing state. [3mblock_from[0m[2m=[0m1016053 [3mblock_to[0m[2m=[0m1016054
+[2m2026-05-25T17:18:05.755841Z[0m [32m INFO[0m [2mmiden_client::sync::state_sync[0m[2m:[0m Fetched note sync data. [3mblocks_with_notes[0m[2m=[0m1 [3mnotes[0m[2m=[0m2 [3mpublic_notes[0m[2m=[0m2
+[2m2026-05-25T17:18:05.821788Z[0m [32m INFO[0m [2mmiden_client::sync[0m[2m:[0m Applying changes to the store.
+[2m2026-05-25T17:18:05.865262Z[0m [32m INFO[0m [2mmiden_client::rpc::tonic_client[0m[2m:[0m Calling GetBlockHeaderByNumber: BlockHeaderByNumberRequest { block_num: Some(1016053), include_mmr_proof: Some(true) }
+[2m2026-05-25T17:18:05.950762Z[0m [32m INFO[0m [2mmiden_client::sync::state_sync[0m[2m:[0m Already at chain tip, nothing to sync. [3mblock_num[0m[2m=[0m1016054
+[2m2026-05-25T17:18:05.950803Z[0m [32m INFO[0m [2mmiden_client::sync[0m[2m:[0m Applying changes to the store.
+[2m2026-05-25T17:18:05.951519Z[0m [32m INFO[0m [2madn_facilitator[0m[2m:[0m note authenticated (attempt 0)
+[2m2026-05-25T17:18:05.955479Z[0m [32m INFO[0m [2madn_facilitator[0m[2m:[0m consuming ADN [3mcumulative[0m[2m=[0m25000
+[2m2026-05-25T17:18:05.974071Z[0m [32m INFO[0m [2mmiden_client::transaction[0m[2m:[0m Proving transaction...
+[2m2026-05-25T17:18:06.161619Z[0m [32m INFO[0m [1mprove_program[0m[2m:[0m [2mmiden_prover[0m[2m:[0m Generated execution trace of 71 columns and 262144 steps (padded from 236115)
+[2m2026-05-25T17:18:34.487328Z[0m [32m INFO[0m [2mmiden_client::transaction[0m[2m:[0m Transaction proven.
+[2m2026-05-25T17:18:34.487367Z[0m [32m INFO[0m [2mmiden_client::transaction[0m[2m:[0m Submitting transaction to the network...
+[2m2026-05-25T17:18:35.534473Z[0m [32m INFO[0m [2mmiden_client::transaction[0m[2m:[0m Transaction submitted.
+[2m2026-05-25T17:18:35.538521Z[0m [32m INFO[0m [2mmiden_client::transaction[0m[2m:[0m Applying transaction to the local store...
+[2m2026-05-25T17:18:35.549282Z[0m [32m INFO[0m [2mmiden_client::transaction[0m[2m:[0m Transaction stored.
+[2m2026-05-25T17:18:35.549374Z[0m [32m INFO[0m [2madn_facilitator[0m[2m:[0m settlement success [3mtx_id[0m[2m=[0m0x89bca110dea55c617ed34a095ddc0c4936fb06a58f58c38dd998582d8497f6c7
+[2m2026-05-25T17:18:35.590386Z[0m [32m INFO[0m [2mmiden_client::sync::state_sync[0m[2m:[0m Syncing state. [3mblock_from[0m[2m=[0m1016054 [3mblock_to[0m[2m=[0m1016064
+[2m2026-05-25T17:18:35.649501Z[0m [32m INFO[0m [2mmiden_client::sync::state_sync[0m[2m:[0m Fetched note sync data. [3mblocks_with_notes[0m[2m=[0m1 [3mnotes[0m[2m=[0m1 [3mpublic_notes[0m[2m=[0m1
+[2m2026-05-25T17:18:35.699171Z[0m [32m INFO[0m [2mmiden_client::sync[0m[2m:[0m Applying changes to the store.
+[2m2026-05-25T17:18:35.719585Z[0m [32m INFO[0m [2madn_facilitator[0m[2m:[0m found remainder ADN output [3mrid[0m[2m=[0m0x6778ad42a0b9912c7c0726ecafa3df35c758e98a36477e9ccd473327b2200665
+[2m2026-05-25T17:18:35.719769Z[0m [32m INFO[0m [2madn_facilitator[0m[2m:[0m found P2ID output [3mrid[0m[2m=[0m0xea4ac9fc176a4bb41a6efe1d45105dcfbb7ab84b3bde9d4bc6e94e5973a458fa

@@ -57,6 +57,22 @@ Tested on real Miden testnet with standalone binaries across 3 AWS EC2 instances
 
 > Note: The ~2ms voucher latency is dominated by Falcon signing (~1.4ms). Network RTT within the same region adds ~0.5ms. Settlement latency is ZK proving — would be ~3s on a c5.4xlarge.
 
+### Cross-continent (Oregon → Virginia → Ireland, 3x t3.xlarge)
+
+50 payments, 2 settlement batches, 0 failures:
+
+| Metric | Value |
+|--------|-------|
+| **Voucher latency p50** | **63ms** |
+| Voucher latency avg | 65ms |
+| Network RTT (Oregon→Virginia) | ~61ms |
+| Protocol overhead | ~2ms (Falcon sign + verify) |
+| Settlement #1 | ~33s (Virginia→Ireland RTT + ZK proving) |
+| Settlement #2 | ~31s |
+| Multi-batch | Working (serial reset + remainder note) |
+
+> The per-voucher latency is dominated by network RTT. The protocol adds only ~2ms on top. With agent and merchant in the same region, latency drops to ~2ms.
+
 ### Compared to other approaches
 
 | | batch-settlement (this) | ADN dual-sig | Guardian verify-before-prove |
