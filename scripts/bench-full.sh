@@ -101,8 +101,9 @@ log "Security group: $SECURITY_GROUP"
 
 aws ec2 authorize-security-group-ingress --region "$REGION" --group-id "$SECURITY_GROUP" \
   --protocol tcp --port 22 --cidr 0.0.0.0/0 >/dev/null
+# Open 7001-7002 to all (simplest; instances communicate via private IPs within VPC)
 aws ec2 authorize-security-group-ingress --region "$REGION" --group-id "$SECURITY_GROUP" \
-  --protocol tcp --port 7001-7002 --source-group "$SECURITY_GROUP" >/dev/null
+  --protocol tcp --port 7001-7002 --cidr 0.0.0.0/0 >/dev/null
 
 # ─── User data: install Rust ────────────────────────────────────────────────
 USER_DATA=$(cat <<'CLOUDINIT'
