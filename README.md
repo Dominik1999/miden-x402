@@ -36,8 +36,26 @@ Phase 2 — Per-Request (zero on-chain txs):
 Phase 3 — Settlement (one on-chain tx):
   Merchant calls facilitator /settle with latest voucher
   Facilitator consumes ADN → P2ID(cumulativeAmount) to merchant + remainder
-  Returns remainderNoteCommitment
+  Returns remainderNoteCommitment → next batch continues from remainder
 ```
+
+## Benchmark Results
+
+Tested on real Miden testnet with standalone binaries across 3 AWS EC2 instances.
+
+### Same-region (us-east-1, 3x t3.xlarge)
+
+50 payments, 2 settlement batches:
+
+| Metric | Value |
+|--------|-------|
+| **Voucher latency p50** | **2.03ms** |
+| Voucher latency avg | 2.49ms |
+| Settlement #1 | ~36s (ZK proving on t3.xlarge) |
+| Settlement #2 | ~32s |
+| Multi-batch | Working (serial reset + remainder note) |
+
+> Note: The ~2ms voucher latency is dominated by Falcon signing (~1.4ms). Network RTT within the same region adds ~0.5ms. Settlement latency is ZK proving — would be ~3s on a c5.4xlarge.
 
 ### Compared to other approaches
 
@@ -47,7 +65,7 @@ Phase 3 — Settlement (one on-chain tx):
 | Facilitator per-request | No | Yes (co-signs) | Yes (verifies + queues) |
 | x402 scheme fit | Direct (`batch-settlement`) | None (custom) | Closest to `exact` |
 | Trust model | Merchant verifies locally | Facilitator co-signs | Facilitator acks |
-| Agent computation | ~2ms (Falcon sign) | ~2ms (Falcon sign) | ~15ms (kernel + sign) |
+| Agent computation | ~1.4ms (Falcon sign) | ~1.4ms (Falcon sign) | ~15ms (kernel + sign) |
 | Privacy | Private note | Private note | Public account state |
 
 ## What's proven
@@ -56,15 +74,43 @@ All tests pass on the real Miden testnet (`rpc.testnet.miden.io`):
 
 - **10 MockChain tests** — consume path, reclaim path, attack vectors
 - **5 voucher unit tests** — sign/verify, cumulative amounts, wrong key/amount
-- **1 e2e testnet test** — full batch-settlement flow: setup → 5 vouchers off-chain → settle → merchant consumes P2ID (34s)
+- **3 wire format tests** — x402 header encode/decode round-trip
+- **1 e2e testnet test** — full batch-settlement flow (34s)
+- **AWS multi-server benchmark** — 50 payments across 3 EC2 instances (2ms p50)
+
+## Standalone binaries
+
+```bash
+# Build
+cargo build --release -p adn-services
+
+# Setup: create accounts + ADN note on testnet
+./target/release/adn-agent setup --data-dir /tmp/agent --out-config /tmp/config.json
+
+# Start facilitator (separate server)
+./target/release/adn-facilitator --port 7002 --data-dir /tmp/fac --account-file fac.b64 --import-keystore /tmp/agent/keystore
+
+# Start merchant (separate server)
+./target/release/adn-merchant --port 7001 --facilitator-url http://facilitator:7002 --merchant-id 0x... --settle-after 25
+
+# Run benchmark
+./target/release/adn-agent benchmark --config /tmp/config.json --merchant-url http://merchant:7001 --payments 50
+```
+
+## One-command AWS benchmark
+
+```bash
+# Launches 3 EC2 instances, builds, runs 50 payments, prints results, terminates
+./scripts/bench-full.sh --key-name my-key --key-file ~/.ssh/my-key.pem --payments 50
+```
 
 ## Layout
 
 ```
 crates/
-  agent-debit-note/        ADN note script (MASM), Rust types, voucher module, tests
-  adn-client/              agent-side signing client
-  x402-facilitator-server/ facilitator with /verify and /settle endpoints
+  agent-debit-note/        ADN note script (MASM), Rust types, voucher, wire format, SDK
+  adn-services/            Standalone binaries: adn-agent, adn-facilitator, adn-merchant
+  adn-client/              Agent-side signing client
 
   # Vendored from OpenZeppelin Guardian
   shared/                  guardian-shared types
@@ -75,10 +121,10 @@ crates/
   contracts/               multisig+guardian account components
   miden-multisig-client/   sign-without-prove client
 
-examples/
-  x402-bench/              latency/throughput benchmark harness
-  reference-merchant/      minimal x402 paywall server
-  setup-testnet/           testnet account + note setup tool
+scripts/
+  bench-full.sh            One-command AWS benchmark (launch → build → run → terminate)
+  bench-local.sh           Local benchmark using e2e test
+  bench-aws.sh             Benchmark on existing EC2 instances by IP
 ```
 
 ## Quick start
@@ -87,9 +133,13 @@ examples/
 # Run MockChain tests (no network needed)
 cargo test -p agent-debit-note --test note_script
 cargo test -p agent-debit-note --test voucher_test
+cargo test -p agent-debit-note --test wire_test
 
 # Run e2e on testnet (requires network access)
 RUST_LOG=info cargo test --release -p agent-debit-note --test batch_settlement_e2e -- --ignored --nocapture
+
+# Run local multi-server benchmark
+./scripts/bench-local.sh
 ```
 
 ## Other approaches (feature branches)
@@ -99,6 +149,8 @@ RUST_LOG=info cargo test --release -p agent-debit-note --test batch_settlement_e
 | `feat/adn-dual-sig` | ADN with agent + facilitator co-signature per payment | Working (9 e2e tests) |
 | `feat/guardian-verify-before-prove` | MultisigGuardian sign-without-prove | WIP |
 | `feat/agentic-guardian` | Hot-key + AP2 mandate enforcement | WIP |
+
+See [docs/x402-scheme-analysis.md](docs/x402-scheme-analysis.md) for analysis of how `exact` and `upto` schemes could be added.
 
 ## Spec reference
 
