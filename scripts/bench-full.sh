@@ -259,13 +259,25 @@ ssh_run "$FACILITATOR_IP" "
     > /tmp/facilitator.log 2>&1 &
 "
 
-for i in $(seq 1 30); do
+FACILITATOR_UP=false
+for i in $(seq 1 60); do
   if ssh_run "$FACILITATOR_IP" "curl -s -o /dev/null -w '%{http_code}' http://localhost:7002/verify -X POST -H 'Content-Type: application/json' -d '{\"note_file_hex\":\"00\",\"merchant_id_hex\":\"0x00\"}'" 2>/dev/null | grep -q 200; then
     log "Facilitator ready."
+    FACILITATOR_UP=true
+    break
+  fi
+  # Check if process is still alive
+  if ! ssh_run "$FACILITATOR_IP" "pgrep -f adn-facilitator" >/dev/null 2>&1; then
+    log "ERROR: Facilitator process died. Log:"
+    ssh_run "$FACILITATOR_IP" "cat /tmp/facilitator.log" 2>/dev/null | tail -20
     break
   fi
   sleep 2
 done
+if [[ "$FACILITATOR_UP" != "true" ]]; then
+  log "ERROR: Facilitator failed to start. Dumping log:"
+  ssh_run "$FACILITATOR_IP" "cat /tmp/facilitator.log" 2>/dev/null | tail -30
+fi
 
 # ─── Start merchant ─────────────────────────────────────────────────────────
 log ""
