@@ -30,7 +30,8 @@ x402-types  = "1.4"
 
 # Miden — pinned to match OZ Guardian's workspace (0.14.5)
 miden-protocol  = "=0.14.5"
-miden-client    = { version = "=0.14.5", features = ["tonic"] }
+miden-client    = { git = "https://github.com/0xMiden/miden-client.git", branch = "main", features = ["tonic", "testing"] }
+miden-client-sqlite-store = { git = "https://github.com/0xMiden/miden-client.git", branch = "main" }
 miden-standards = "=0.14.5"
 miden-tx        = "=0.14.5"
 miden-remote-prover-client = "0.14"
@@ -42,6 +43,8 @@ guardian-shared       = { git = "https://github.com/OpenZeppelin/guardian", bran
 guardian-client       = { git = "https://github.com/OpenZeppelin/guardian", branch = "main" }
 miden-multisig-client = { git = "https://github.com/OpenZeppelin/guardian", branch = "main" }
 miden-rpc-client      = { git = "https://github.com/OpenZeppelin/guardian", branch = "main" }
+miden-confidential-contracts = { git = "https://github.com/OpenZeppelin/guardian", branch = "main" }
+miden-keystore        = { git = "https://github.com/OpenZeppelin/guardian", branch = "main" }
 
 # HTTP / runtime / observability
 axum               = { version = "0.8", features = ["macros"] }

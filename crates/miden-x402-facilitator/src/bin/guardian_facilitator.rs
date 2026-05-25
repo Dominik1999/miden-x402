@@ -112,6 +112,7 @@ async fn main() -> anyhow::Result<()> {
         canonicalization: None, // canonicalization worker spawned only when configured
         clock,
         dashboard,
+        auditor: Arc::new(server::audit::LogAuditor),
     };
 
     // ----- x402 storage repos (filesystem) -------------------------------

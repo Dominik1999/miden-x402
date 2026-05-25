@@ -53,3 +53,7 @@ anyhow             = "1"
 tower    = { workspace = true, features = ["util"] }
 tempfile = "3"
 tokio    = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+miden-client-sqlite-store = { workspace = true }
+miden-confidential-contracts = { workspace = true }
+miden-multisig-client = { workspace = true }
+miden-keystore = { workspace = true }
