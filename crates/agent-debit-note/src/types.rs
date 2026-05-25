@@ -15,7 +15,7 @@ pub struct AgentDebitNoteStorage {
     pub user_pubkey_commitment: Word,
     pub merchant_account_id: AccountId,
     pub user_account_id: AccountId,
-    pub reclaim_block_height: u32,
+    pub reclaim_block_height: u64,
 }
 
 impl AgentDebitNoteStorage {
@@ -23,7 +23,7 @@ impl AgentDebitNoteStorage {
         user_pubkey_commitment: Word,
         merchant_account_id: AccountId,
         user_account_id: AccountId,
-        reclaim_block_height: u32,
+        reclaim_block_height: u64,
     ) -> Self {
         Self {
             user_pubkey_commitment,
@@ -46,7 +46,7 @@ impl From<AgentDebitNoteStorage> for NoteStorage {
             s.merchant_account_id.prefix().as_felt(),
             s.user_account_id.suffix(),
             s.user_account_id.prefix().as_felt(),
-            Felt::new(s.reclaim_block_height as u64),
+            Felt::new(s.reclaim_block_height),
         ])
         .expect("9 storage items should not exceed max")
     }

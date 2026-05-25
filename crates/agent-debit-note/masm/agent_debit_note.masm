@@ -61,6 +61,8 @@ pub proc main
     drop drop
 
     # Route by block height
+    # block_number > reclaim_block → consume (not expired)
+    # block_number <= reclaim_block → reclaim (expired or at expiry)
     exec.tx::get_block_number
     mem_load.RECLAIM_BLOCK_PTR
     swap gt
