@@ -1,0 +1,4 @@
+[2m2026-05-21T08:11:43.084552Z[0m [32m INFO[0m [2mreference_merchant[0m[2m:[0m reference-merchant listening [3maddr[0m[2m=[0m0.0.0.0:7001
+[2m2026-05-21T08:12:10.596845Z[0m [33m WARN[0m [2mreference_merchant[0m[2m:[0m rejecting PAYMENT-SIGNATURE; re-issuing 402 [3mreason[0m[2m=[0minvalid: status=failed
+[2m2026-05-21T08:12:13.626461Z[0m [33m WARN[0m [2mreference_merchant[0m[2m:[0m rejecting PAYMENT-SIGNATURE; re-issuing 402 [3mreason[0m[2m=[0minvalid: status=failed
+[2m2026-05-21T08:12:18.618490Z[0m [33m WARN[0m [2mreference_merchant[0m[2m:[0m rejecting PAYMENT-SIGNATURE; re-issuing 402 [3mreason[0m[2m=[0minvalid: status=failed
