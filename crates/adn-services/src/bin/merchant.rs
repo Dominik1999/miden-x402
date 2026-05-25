@@ -49,6 +49,8 @@ struct MerchantInner {
     settle_after: usize,
     request_count: usize,
     latest_payment: Option<PaymentRequest>,
+    /// NoteFile hex from the first payment (needed for settlement)
+    stored_note_file_hex: Option<String>,
 }
 
 type SharedMerchant = Arc<Mutex<MerchantInner>>;
@@ -76,6 +78,10 @@ async fn handle_pay(
     s.request_count += 1;
     let count = s.request_count;
     let settle_after = s.settle_after;
+    // Store NoteFile from first payment
+    if payment.note_file_hex.is_some() && s.stored_note_file_hex.is_none() {
+        s.stored_note_file_hex = payment.note_file_hex.clone();
+    }
     s.latest_payment = Some(payment);
 
     tracing::info!(count, "voucher received");
@@ -87,8 +93,13 @@ async fn handle_pay(
         let merchant_id = s.merchant_id.clone();
         drop(s); // release lock before HTTP call
 
+        // Use stored NoteFile from first payment
+        let note_file_hex = {
+            let s2 = state.lock().await;
+            s2.stored_note_file_hex.clone().unwrap_or_default()
+        };
         let settle_req = SettleRequest {
-            note_file_hex: payment.note_file_hex.unwrap_or_default(),
+            note_file_hex,
             agent_sk_hex: payment.agent_sk_hex,
             serial_num: payment.serial_num,
             cumulative_amount: payment.cumulative_amount,
@@ -188,6 +199,7 @@ async fn main() -> anyhow::Result<()> {
         settle_after: args.settle_after,
         request_count: 0,
         latest_payment: None,
+        stored_note_file_hex: None,
     }));
 
     let app = axum::Router::new()
