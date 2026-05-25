@@ -2,33 +2,34 @@ use miden_protocol::Word;
 use miden_protocol::account::AccountId;
 use miden_protocol::note::NoteStorage;
 
-/// Storage layout for the AgentDebitNote.
+/// Storage layout for the AgentDebitNote (batch-settlement spec).
 ///
-/// 11 storage items:
-///   [0-3]  agent_pubkey_commitment (Word)
-///   [4-7]  facilitator_pubkey_commitment (Word)
-///   [8]    user_account_id_suffix
-///   [9]    user_account_id_prefix
-///   [10]   expiry_block_height
+/// 9 storage items:
+///   [0-3]  user_pub_key_commitment (Word) — agent's Falcon public key
+///   [4]    merchant_account_id_suffix — committed payee
+///   [5]    merchant_account_id_prefix
+///   [6]    user_account_id_suffix — for reclaim path
+///   [7]    user_account_id_prefix
+///   [8]    reclaim_block_height
 pub struct AgentDebitNoteStorage {
-    pub agent_pubkey_commitment: Word,
-    pub facilitator_pubkey_commitment: Word,
+    pub user_pubkey_commitment: Word,
+    pub merchant_account_id: AccountId,
     pub user_account_id: AccountId,
-    pub expiry_block_height: u32,
+    pub reclaim_block_height: u32,
 }
 
 impl AgentDebitNoteStorage {
     pub fn new(
-        agent_pubkey_commitment: Word,
-        facilitator_pubkey_commitment: Word,
+        user_pubkey_commitment: Word,
+        merchant_account_id: AccountId,
         user_account_id: AccountId,
-        expiry_block_height: u32,
+        reclaim_block_height: u32,
     ) -> Self {
         Self {
-            agent_pubkey_commitment,
-            facilitator_pubkey_commitment,
+            user_pubkey_commitment,
+            merchant_account_id,
             user_account_id,
-            expiry_block_height,
+            reclaim_block_height,
         }
     }
 }
@@ -37,18 +38,16 @@ impl From<AgentDebitNoteStorage> for NoteStorage {
     fn from(s: AgentDebitNoteStorage) -> Self {
         use miden_protocol::Felt;
         NoteStorage::new(vec![
-            s.agent_pubkey_commitment[0],
-            s.agent_pubkey_commitment[1],
-            s.agent_pubkey_commitment[2],
-            s.agent_pubkey_commitment[3],
-            s.facilitator_pubkey_commitment[0],
-            s.facilitator_pubkey_commitment[1],
-            s.facilitator_pubkey_commitment[2],
-            s.facilitator_pubkey_commitment[3],
+            s.user_pubkey_commitment[0],
+            s.user_pubkey_commitment[1],
+            s.user_pubkey_commitment[2],
+            s.user_pubkey_commitment[3],
+            s.merchant_account_id.suffix(),
+            s.merchant_account_id.prefix().as_felt(),
             s.user_account_id.suffix(),
             s.user_account_id.prefix().as_felt(),
-            Felt::new(s.expiry_block_height as u64),
+            Felt::new(s.reclaim_block_height as u64),
         ])
-        .expect("11 storage items should not exceed max")
+        .expect("9 storage items should not exceed max")
     }
 }

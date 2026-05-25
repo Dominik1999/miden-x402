@@ -11,12 +11,11 @@ use crate::types::AgentDebitNoteStorage;
 /// The MASM source for the AgentDebitNote script.
 pub const AGENT_DEBIT_NOTE_MASM: &str = include_str!("../masm/agent_debit_note.masm");
 
-/// Create an AgentDebitNote — a pre-funded note that can be consumed by anyone
-/// who presents a valid agent signature over (note_serial_num, merchant, amount).
+/// Create an AgentDebitNote — a pre-funded note with committed merchant.
 ///
-/// The note script enforces:
-///   - Before expiry: creates P2ID to merchant + remainder AgentDebitNote
-///   - After expiry: allows user to reclaim full balance
+/// The note script enforces (batch-settlement spec):
+///   - Before reclaim_block_height: agent sig → P2ID(cumulativeAmount) to committed merchant + remainder
+///   - After reclaim_block_height: agent sig → P2ID(full_balance) to user
 pub fn create<R: FeltRng>(
     sender: AccountId,
     note_script: miden_protocol::note::NoteScript,

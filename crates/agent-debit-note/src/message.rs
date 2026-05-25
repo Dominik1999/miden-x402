@@ -2,18 +2,21 @@ use miden_protocol::{Hasher, Word};
 use miden_protocol::Felt;
 use miden_protocol::account::AccountId;
 
-/// Compute the message the agent signs to authorize a debit.
+/// Compute the debit/voucher message the agent signs.
 ///
-/// MESSAGE = poseidon2::merge(SERIAL_NUM, [merchant_suffix, merchant_prefix, amount, 0])
+/// MESSAGE = poseidon2::merge(SERIAL_NUM, [merchant_suffix, merchant_prefix, cumulative_amount, 0])
+///
+/// This matches the MASM consume path message computation. The merchant comes
+/// from committed storage, and cumulative_amount is the total debited so far.
 pub fn debit_message(
     note_serial_num: Word,
     merchant_account_id: AccountId,
-    amount: u64,
+    cumulative_amount: u64,
 ) -> Word {
     let debit_word = Word::from([
         merchant_account_id.suffix(),
         merchant_account_id.prefix().as_felt(),
-        Felt::new(amount),
+        Felt::new(cumulative_amount),
         Felt::ZERO,
     ]);
     merge_words(note_serial_num, debit_word)
