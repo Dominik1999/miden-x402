@@ -75,12 +75,14 @@ async fn handle_settle(
         return Json(SettleResponse {
             success: false, tx_hash: String::new(), settled_amount: 0,
             remainder_balance: 0, p2id_note_file_hex: None,
+            remainder_note_file_hex: None, new_serial_num: None,
             error: Some("facilitator down".into()),
         });
     }
     Json(resp_rx.await.unwrap_or(SettleResponse {
         success: false, tx_hash: String::new(), settled_amount: 0,
         remainder_balance: 0, p2id_note_file_hex: None,
+        remainder_note_file_hex: None, new_serial_num: None,
         error: Some("facilitator dropped".into()),
     }))
 }
@@ -166,7 +168,9 @@ async fn process_settle(
 ) -> SettleResponse {
     let fail = |msg: &str| SettleResponse {
         success: false, tx_hash: String::new(), settled_amount: 0,
-        remainder_balance: 0, p2id_note_file_hex: None, error: Some(msg.into()),
+        remainder_balance: 0, p2id_note_file_hex: None,
+        remainder_note_file_hex: None, new_serial_num: None,
+        error: Some(msg.into()),
     };
 
     let note_file_bytes = match hex::decode(&req.note_file_hex) {
@@ -248,23 +252,42 @@ async fn process_settle(
         Ok(tx_id) => {
             tracing::info!(%tx_id, "settlement success");
 
+            // Find both output notes: P2ID (2 storage) and remainder ADN (9 storage)
             let mut p2id_hex = None;
+            let mut remainder_hex = None;
+            let mut new_serial = None;
             for _attempt in 0..60 {
                 client.sync_state().await.unwrap();
                 for record in client.get_output_notes(NoteFilter::All).await.unwrap() {
                     if record.inclusion_proof().is_some() {
+                        let rid = record.id();
                         if let Ok(nf) = record.into_note_file(&NoteExportType::NoteWithProof) {
                             let nf_bytes = nf.to_bytes();
                             if let Ok(NoteFile::NoteWithProof(n, _)) = NoteFile::read_from_bytes(&nf_bytes) {
-                                if n.recipient().storage().num_items() == 2 {
+                                let items = n.recipient().storage().num_items();
+                                if items == 2 && p2id_hex.is_none() {
+                                    tracing::info!(%rid, "found P2ID output");
                                     p2id_hex = Some(hex::encode(&nf_bytes));
-                                    break;
+                                } else if items == 9 && remainder_hex.is_none() {
+                                    tracing::info!(%rid, "found remainder ADN output");
+                                    remainder_hex = Some(hex::encode(&nf_bytes));
+                                    // Compute new serial: element[0] + 1
+                                    let serial_felts: [Felt; 4] = n.recipient().serial_num().into();
+                                    new_serial = Some([
+                                        format!("0x{:x}", serial_felts[0].as_canonical_u64()),
+                                        format!("0x{:x}", serial_felts[1].as_canonical_u64()),
+                                        format!("0x{:x}", serial_felts[2].as_canonical_u64()),
+                                        format!("0x{:x}", serial_felts[3].as_canonical_u64()),
+                                    ]);
                                 }
                             }
                         }
                     }
                 }
-                if p2id_hex.is_some() { break; }
+                if p2id_hex.is_some() && remainder_hex.is_some() { break; }
+                if p2id_hex.is_some() && note_balance == req.cumulative_amount {
+                    break; // No remainder when fully consumed
+                }
                 tokio::time::sleep(Duration::from_secs(3)).await;
             }
 
@@ -274,6 +297,8 @@ async fn process_settle(
                 settled_amount: req.cumulative_amount,
                 remainder_balance: note_balance.saturating_sub(req.cumulative_amount),
                 p2id_note_file_hex: p2id_hex,
+                remainder_note_file_hex: remainder_hex,
+                new_serial_num: new_serial,
                 error: None,
             }
         }

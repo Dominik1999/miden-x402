@@ -37,6 +37,10 @@ pub struct SettleResponse {
     pub settled_amount: u64,
     pub remainder_balance: u64,
     pub p2id_note_file_hex: Option<String>,
+    /// Remainder ADN note file (for next settlement batch)
+    pub remainder_note_file_hex: Option<String>,
+    /// New serial_num for the remainder note (element[0] incremented)
+    pub new_serial_num: Option<[String; 4]>,
     pub error: Option<String>,
 }
 
@@ -51,7 +55,7 @@ pub struct PaymentRequired {
 /// Agent → Merchant: payment with voucher
 #[derive(Serialize, Deserialize, Debug)]
 pub struct PaymentRequest {
-    /// First request: hex-encoded NoteFile. Subsequent: None.
+    /// First request (or after settlement): hex-encoded NoteFile
     pub note_file_hex: Option<String>,
     pub agent_sk_hex: String,
     pub serial_num: [String; 4],
@@ -65,4 +69,8 @@ pub struct PaymentResponse {
     pub success: bool,
     pub resource: Option<String>,
     pub error: Option<String>,
+    /// If settlement occurred, the new serial for the next batch
+    pub new_serial_num: Option<[String; 4]>,
+    /// Signals that the agent should reset cumulative amount to 0
+    pub settlement_occurred: Option<bool>,
 }

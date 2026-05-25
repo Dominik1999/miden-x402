@@ -277,15 +277,24 @@ async fn run_benchmark(config_path: &str, merchant_url: &str, payments: usize, a
         _ => anyhow::bail!("expected Falcon512Poseidon2 key"),
     };
 
-    let serial_num: Word = [
-        Felt::new(parse_hex(&config.serial_num[0])),
-        Felt::new(parse_hex(&config.serial_num[1])),
-        Felt::new(parse_hex(&config.serial_num[2])),
-        Felt::new(parse_hex(&config.serial_num[3])),
+    // Mutable state — updated after each settlement
+    let mut current_serial = [
+        config.serial_num[0].clone(),
+        config.serial_num[1].clone(),
+        config.serial_num[2].clone(),
+        config.serial_num[3].clone(),
+    ];
+    let mut current_serial_word: Word = [
+        Felt::new(parse_hex(&current_serial[0])),
+        Felt::new(parse_hex(&current_serial[1])),
+        Felt::new(parse_hex(&current_serial[2])),
+        Felt::new(parse_hex(&current_serial[3])),
     ].into();
+    let mut cumulative = 0u64;
+    let mut send_note_file = true; // Send NoteFile on first request and after settlement
+    let mut settlements = 0u32;
 
     let http = reqwest::Client::new();
-    let mut cumulative = 0u64;
 
     eprintln!("\n=== BENCHMARK: {payments} payments of {amount_per} each ===\n");
 
@@ -296,18 +305,19 @@ async fn run_benchmark(config_path: &str, merchant_url: &str, payments: usize, a
         cumulative += amount_per;
 
         let sign_start = std::time::Instant::now();
-        let sig = sign_voucher(&agent_sk, serial_num, merchant_id, cumulative);
+        let sig = sign_voucher(&agent_sk, current_serial_word, merchant_id, cumulative);
         let sign_dur = sign_start.elapsed();
         let sig_hex = hex::encode(sig.to_bytes());
 
         let send_start = std::time::Instant::now();
         let payment = adn_services::PaymentRequest {
-            note_file_hex: if i == 1 { Some(config.note_file_hex.clone()) } else { None },
+            note_file_hex: if send_note_file { Some(config.note_file_hex.clone()) } else { None },
             agent_sk_hex: config.agent_sk_hex.clone(),
-            serial_num: config.serial_num.clone(),
+            serial_num: current_serial.clone(),
             cumulative_amount: cumulative,
             signature_hex: sig_hex,
         };
+        send_note_file = false; // Only send on first request per batch
 
         let resp = http
             .post(format!("{merchant_url}/pay"))
@@ -322,12 +332,34 @@ async fn run_benchmark(config_path: &str, merchant_url: &str, payments: usize, a
         voucher_times.push(total_dur);
 
         if payment_resp.success {
+            let settled = payment_resp.settlement_occurred.unwrap_or(false);
             eprintln!(
-                "[{i:>3}/{payments}] cumulative={cumulative:>8}  sign={:>6.2}ms  rtt={:>8.2}ms  total={:>8.2}ms",
+                "[{i:>3}/{payments}] cumulative={cumulative:>8}  sign={:>6.2}ms  rtt={:>8.2}ms  total={:>8.2}ms{}",
                 sign_dur.as_secs_f64() * 1000.0,
                 send_dur.as_secs_f64() * 1000.0,
                 total_dur.as_secs_f64() * 1000.0,
+                if settled { "  ← SETTLED" } else { "" },
             );
+
+            // If settlement occurred, update serial and reset cumulative
+            if settled {
+                settlements += 1;
+                if let Some(new_serial) = payment_resp.new_serial_num {
+                    current_serial = new_serial;
+                    current_serial_word = [
+                        Felt::new(parse_hex(&current_serial[0])),
+                        Felt::new(parse_hex(&current_serial[1])),
+                        Felt::new(parse_hex(&current_serial[2])),
+                        Felt::new(parse_hex(&current_serial[3])),
+                    ].into();
+                    eprintln!("        → new serial[0]={}  cumulative reset to 0", &current_serial[0]);
+                }
+                cumulative = 0;
+                send_note_file = true; // Merchant has new note, but agent doesn't have it
+                // Actually the merchant already stored the remainder note from facilitator
+                // Agent doesn't need to resend it — merchant will use its stored copy
+                send_note_file = false;
+            }
         } else {
             eprintln!("[{i:>3}/{payments}] FAILED: {:?}", payment_resp.error);
             if i > 1 { continue; } else { anyhow::bail!("first payment failed"); }
@@ -345,14 +377,26 @@ async fn run_benchmark(config_path: &str, merchant_url: &str, payments: usize, a
     let mean: f64 = times_ms.iter().sum::<f64>() / times_ms.len() as f64;
     let throughput = payments as f64 / bench_dur.as_secs_f64();
 
+    // Separate settlement latencies from voucher latencies
+    let settle_threshold_ms = 1000.0; // anything > 1s is a settlement
+    let voucher_only: Vec<f64> = times_ms.iter().filter(|&&t| t < settle_threshold_ms).copied().collect();
+    let v_p50 = if !voucher_only.is_empty() { voucher_only[voucher_only.len() / 2] } else { 0.0 };
+    let v_mean: f64 = if !voucher_only.is_empty() { voucher_only.iter().sum::<f64>() / voucher_only.len() as f64 } else { 0.0 };
+
     eprintln!("\n=== RESULTS ===");
-    eprintln!("  Payments:    {payments}");
-    eprintln!("  Total time:  {:.2}s", bench_dur.as_secs_f64());
-    eprintln!("  Throughput:  {throughput:.1} vouchers/sec");
-    eprintln!("  Latency p50: {p50:.2}ms");
-    eprintln!("  Latency p95: {p95:.2}ms");
-    eprintln!("  Latency p99: {p99:.2}ms");
-    eprintln!("  Latency avg: {mean:.2}ms");
+    eprintln!("  Payments:      {payments}");
+    eprintln!("  Settlements:   {settlements}");
+    eprintln!("  Total time:    {:.2}s", bench_dur.as_secs_f64());
+    eprintln!("  Throughput:    {throughput:.1} vouchers/sec");
+    eprintln!("  --- All (incl. settlement) ---");
+    eprintln!("  Latency p50:   {p50:.2}ms");
+    eprintln!("  Latency p95:   {p95:.2}ms");
+    eprintln!("  Latency p99:   {p99:.2}ms");
+    eprintln!("  Latency avg:   {mean:.2}ms");
+    eprintln!("  --- Voucher only (off-chain) ---");
+    eprintln!("  Voucher p50:   {v_p50:.2}ms");
+    eprintln!("  Voucher avg:   {v_mean:.2}ms");
+    eprintln!("  Voucher count: {}", voucher_only.len());
 
     Ok(())
 }
