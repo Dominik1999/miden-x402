@@ -15,7 +15,18 @@ hex = { workspace = true }
 
 [dev-dependencies]
 miden-testing = { workspace = true }
-tokio = { workspace = true, features = ["rt", "macros"] }
+miden-client = { git = "https://github.com/0xMiden/miden-client.git", branch = "main", features = ["testing", "tonic"] }
+miden-client-sqlite-store = { git = "https://github.com/0xMiden/miden-client.git", branch = "main" }
+miden-standards = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 anyhow = { workspace = true }
 rand = { workspace = true }
 rand_chacha = { workspace = true }
+tempfile = { workspace = true }
+base64 = { workspace = true }
+toml = "0.8"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+axum = "0.8"
+reqwest = { version = "0.12", features = ["json"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
