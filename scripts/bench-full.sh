@@ -233,14 +233,15 @@ log "Setup complete."
 # ─── Distribute config ──────────────────────────────────────────────────────
 log "Distributing config..."
 
-# Agent → local → facilitator/merchant
+# Agent → local → facilitator/merchant (use tar to avoid scp -r nesting issues)
 scp $SSH_OPTS "${SSH_USER}@${AGENT_IP}:/tmp/bench-config.json" /tmp/bench-config-aws.json
-scp -r $SSH_OPTS "${SSH_USER}@${AGENT_IP}:/tmp/adn-bench/keystore" /tmp/adn-keystore-aws
+ssh_run "$AGENT_IP" "cd /tmp/adn-bench && tar czf /tmp/keystore.tar.gz keystore/"
+scp $SSH_OPTS "${SSH_USER}@${AGENT_IP}:/tmp/keystore.tar.gz" /tmp/keystore-aws.tar.gz
 
 scp $SSH_OPTS /tmp/bench-config-aws.json "${SSH_USER}@${FACILITATOR_IP}:/tmp/bench-config.json"
 scp $SSH_OPTS /tmp/bench-config-aws.json "${SSH_USER}@${MERCHANT_IP}:/tmp/bench-config.json"
-ssh_run "$FACILITATOR_IP" "mkdir -p /tmp/adn-bench"
-scp -r $SSH_OPTS /tmp/adn-keystore-aws "${SSH_USER}@${FACILITATOR_IP}:/tmp/adn-bench/keystore"
+scp $SSH_OPTS /tmp/keystore-aws.tar.gz "${SSH_USER}@${FACILITATOR_IP}:/tmp/keystore.tar.gz"
+ssh_run "$FACILITATOR_IP" "mkdir -p /tmp/adn-bench && cd /tmp/adn-bench && tar xzf /tmp/keystore.tar.gz"
 
 # ─── Start facilitator ──────────────────────────────────────────────────────
 log ""
