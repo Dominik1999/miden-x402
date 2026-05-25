@@ -180,7 +180,7 @@ pub(crate) async fn create_miden_client(
     configured_client_builder(endpoint)
         .store(store)
         .rng(rng)
-        .in_debug_mode(DebugMode::Enabled)
+        .in_debug_mode(DebugMode::Disabled)
         .tx_discard_delta(Some(20))
         .max_block_number_delta(256)
         .build()

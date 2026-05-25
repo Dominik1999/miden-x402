@@ -84,7 +84,7 @@ struct Args {
     adn_amount: u64,
 
     /// Expiry block height for the AgentDebitNote (blocks from current).
-    #[arg(long, default_value_t = 100_000u32)]
+    #[arg(long, default_value_t = 10_000_000u32)]
     adn_expiry_blocks: u32,
 }
 

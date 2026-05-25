@@ -238,7 +238,7 @@ async fn test_adn_full_flow() {
 
     let note_id = "0xdeadbeef01234567";
     let serial: Word = [Felt::new(100), Felt::new(200), Felt::new(300), Felt::new(400)].into();
-    let expiry_block: u32 = 1_000_000;
+    let expiry_block: u32 = 10_000_000;
 
     let adn_client = adn_client::client::AdnClient::new(
         agent_sk,
